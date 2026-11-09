@@ -11,6 +11,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    false,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -56,6 +57,9 @@ class Invoice(Base):
     processing_error: Mapped[str | None] = mapped_column(Text)
     validation_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="NOT_CHECKED"
+    )
+    is_verified: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=false()
     )
     raw_extraction_json: Mapped[dict | None] = mapped_column(JSON)
     extraction_metadata: Mapped[dict | None] = mapped_column(JSON)

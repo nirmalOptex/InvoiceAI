@@ -37,6 +37,13 @@ _CURRENCIES = re.compile(
     r"\b(NPR|USD|EUR|GBP|INR|CAD|AUD|JPY|CNY|CHF|AED|SGD|NZD)\b",
     re.IGNORECASE,
 )
+_PAYMENT_RECEIPT_TITLE = re.compile(r"\b(?:premium|payment)\s+receipt\b", re.I)
+_RECEIPT_LABEL = re.compile(
+    r"^\s*(?:control\s*(?:no\.?|number|#)|received|payment\s+date|"
+    r"payment\s+method|policy\s+number|policy\s+owner|next\s+due\s+date|"
+    r"on\s+account\s+of)\b",
+    re.I,
+)
 _ELBOW_ANGLE_DIMENSION = re.compile(r"\b(elbow)\s+(90)(?=\d{2,}\s*mm\b)", re.I)
 _PAGE_LINE = re.compile(
     r"^\[Page\s+(\d+)(?:\s+x1=([\d.]+)\s+y1=([\d.]+)"
@@ -308,6 +315,133 @@ def _normalize_item_description(value: str) -> str:
     return _ELBOW_ANGLE_DIMENSION.sub(r"\1 \2° ", value)
 
 
+def _receipt_value(
+    records: list[_OCRRecord], pattern: re.Pattern[str]
+) -> str | None:
+    for index, record in enumerate(records):
+        match = pattern.match(record.text)
+        if match is None:
+            continue
+        inline_value = record.text[match.end() :].strip(" \t:=-")
+        if inline_value:
+            return inline_value
+        for candidate in records[index + 1 : index + 4]:
+            value = candidate.text.strip()
+            if not value or not value.strip(":=- "):
+                continue
+            if _RECEIPT_LABEL.match(value):
+                break
+            return value.strip(" \t:=-")
+    return None
+
+
+def _extract_payment_receipt(
+    records: list[_OCRRecord], warnings: list[str]
+) -> dict[str, Any]:
+    title_index = next(
+        index
+        for index, record in enumerate(records)
+        if _PAYMENT_RECEIPT_TITLE.search(record.text)
+    )
+    header = [record.text.strip() for record in records[:title_index]]
+    issuer = next(
+        (
+            text
+            for text in header
+            if not text.startswith("(")
+            and re.search(
+                r"\b(?:company|co\.?|limited|ltd\.?|incorporated|insurance|"
+                r"corporation|corp\.?)\b",
+                text,
+                re.I,
+            )
+        ),
+        next((text for text in header if text and not text.startswith("(")), None),
+    )
+    receipt_number = _receipt_value(
+        records, re.compile(r"^\s*control\s*(?:no\.?|number|#)\s*[:#-]?\s*", re.I)
+    )
+    payment_date = _receipt_value(
+        records, re.compile(r"^\s*payment\s+date\s*[:#-]?\s*", re.I)
+    )
+    amount_text = _receipt_value(records, re.compile(r"^\s*received\b\s*[:#-]?\s*", re.I))
+    amount_received = _parse_amount(amount_text or "")
+    currency = next(
+        (
+            match.group(1).upper()
+            for record in records
+            if (match := _CURRENCIES.search(record.text)) is not None
+        ),
+        None,
+    )
+    normalized_payment_date = (
+        _normalize_ocr_date(payment_date, warnings) if payment_date else None
+    )
+    policy_number = _receipt_value(
+        records, re.compile(r"^\s*policy\s+number\s*[:#-]?\s*", re.I)
+    )
+    policy_owner = _receipt_value(
+        records,
+        re.compile(
+            r"^\s*policy\s+owner(?:['\"’]s)?\s+name\s*[:#-]?\s*", re.I
+        ),
+    )
+    payment_method = _receipt_value(
+        records, re.compile(r"^\s*payment\s+method\s*[:#-]?\s*", re.I)
+    )
+    next_due_date = _receipt_value(
+        records, re.compile(r"^\s*next\s+due\s+date\s*[:#-]?\s*", re.I)
+    )
+    account_of = _receipt_value(
+        records, re.compile(r"^\s*on\s+account\s+of\s*[:#-]?\s*", re.I)
+    )
+    normalized_next_due_date = (
+        _normalize_ocr_date(next_due_date, warnings) if next_due_date else None
+    )
+    receipt_fields = {
+        "receipt_number": receipt_number,
+        "payment_date": normalized_payment_date,
+        "amount_received": str(amount_received) if amount_received is not None else None,
+        "currency": currency,
+        "policy_number": policy_number,
+        "policy_owner": policy_owner,
+        "payment_method": payment_method,
+        "next_due_date": normalized_next_due_date,
+        "account_of": account_of,
+    }
+    if not any(
+        receipt_fields[field] is not None
+        for field in ("receipt_number", "payment_date", "amount_received")
+    ):
+        raise ProviderError(
+            "A payment receipt was detected, but its receipt number, payment date, "
+            "and received amount could not be read. Use a clearer document or enter "
+            "the receipt details manually."
+        )
+
+    warnings.append(
+        "Payment receipt detected. Review the receipt details against the original document."
+    )
+    return {
+        "document_type": "payment_receipt",
+        "receipt_fields": receipt_fields,
+        "supplier_name": issuer,
+        "supplier_address": None,
+        "supplier_tax_id": None,
+        "invoice_number": receipt_number,
+        "invoice_date": normalized_payment_date,
+        "due_date": None,
+        "currency": currency,
+        "items": [],
+        "subtotal": None,
+        "discount": None,
+        "tax_rate": None,
+        "tax_amount": None,
+        "additional_charges": None,
+        "total_amount": str(amount_received) if amount_received is not None else None,
+    }
+
+
 def _table_columns(
     records: list[_OCRRecord],
 ) -> tuple[float, float, list[float]] | None:
@@ -532,6 +666,8 @@ class LocalRuleBasedProvider:
                 "Local extraction found no readable OCR text. Check the document image "
                 "or enter its details manually."
             )
+        if any(_PAYMENT_RECEIPT_TITLE.search(record.text) for record in records):
+            return _extract_payment_receipt(records, self.warnings)
 
         data: dict[str, Any] = {
             "supplier_name": _labeled_value(records, "supplier_name"),

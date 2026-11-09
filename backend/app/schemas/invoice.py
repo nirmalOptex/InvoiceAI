@@ -133,6 +133,7 @@ class InvoiceRead(InvoiceData):
     processing_status: ProcessingStatus
     processing_error: str | None
     validation_status: ValidationStatus
+    is_verified: bool
     raw_extraction_json: dict[str, Any] | None
     extraction_metadata: dict[str, Any] | None
     items: list[InvoiceItemRead]
@@ -159,6 +160,7 @@ class InvoiceListItem(BaseModel):
     processing_status: ProcessingStatus
     processing_error: str | None
     validation_status: ValidationStatus
+    is_verified: bool
     created_at: datetime
 
 
@@ -193,6 +195,7 @@ class DashboardRecentInvoice(BaseModel):
     total_amount: Decimal | None
     processing_status: ProcessingStatus
     validation_status: ValidationStatus
+    is_verified: bool
     created_at: datetime
 
 

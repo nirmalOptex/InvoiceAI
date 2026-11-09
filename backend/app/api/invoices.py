@@ -14,7 +14,7 @@ from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import Settings, get_settings
@@ -557,7 +557,20 @@ def list_invoices(
             )
         )
     if validation_status is not None:
-        filters.append(Invoice.validation_status == validation_status.value)
+        if validation_status == ValidationStatus.PASSED:
+            filters.append(
+                or_(
+                    Invoice.validation_status == validation_status.value,
+                    Invoice.is_verified.is_(True),
+                )
+            )
+        else:
+            filters.append(
+                and_(
+                    Invoice.validation_status == validation_status.value,
+                    Invoice.is_verified.is_(False),
+                )
+            )
     if processing_status is not None:
         filters.append(Invoice.processing_status == processing_status.value)
     if filters:
@@ -589,6 +602,22 @@ def get_invoice(
     return _invoice_or_404(session, invoice_id)
 
 
+@router.post("/invoices/{invoice_id}/verify", response_model=InvoiceRead)
+def verify_invoice(
+    invoice_id: int,
+    session: Annotated[Session, Depends(get_db)],
+) -> Invoice:
+    invoice = _invoice_or_404(session, invoice_id)
+    if invoice.processing_status != ProcessingStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only completed invoices can be marked as verified.",
+        )
+    invoice.is_verified = True
+    session.commit()
+    return _invoice_or_404(session, invoice_id)
+
+
 @router.post(
     "/invoices/{invoice_id}/reprocess",
     response_model=InvoiceRead,
@@ -617,6 +646,7 @@ def reprocess_invoice(
     invoice.processing_status = ProcessingStatus.PROCESSING.value
     invoice.processing_error = None
     invoice.validation_status = ValidationStatus.PENDING.value
+    invoice.is_verified = False
     session.commit()
     _queue_invoice_processing(invoice.id, invoice.stored_filename, settings)
     return _invoice_or_404(session, invoice_id)
@@ -659,6 +689,7 @@ def update_invoice(
             detail="Items must be an array; use an empty array to remove all line items.",
         )
     _apply_corrections(invoice, correction)
+    invoice.is_verified = False
     if invoice.currency is not None:
         invoice.currency = invoice.currency.upper()
     for item in invoice.items:
@@ -759,7 +790,10 @@ def dashboard_stats(
     passed = int(
         session.scalar(
             select(func.count()).select_from(Invoice).where(
-                Invoice.validation_status == ValidationStatus.PASSED.value
+                or_(
+                    Invoice.validation_status == ValidationStatus.PASSED.value,
+                    Invoice.is_verified.is_(True),
+                )
             )
         )
         or 0
@@ -777,14 +811,17 @@ def dashboard_stats(
             select(func.count())
             .select_from(Invoice)
             .where(
-                or_(
-                    Invoice.processing_status == ProcessingStatus.FAILED.value,
-                    Invoice.validation_status.in_(
-                        [
-                            ValidationStatus.FAILED.value,
-                            ValidationStatus.WARNING.value,
-                            ValidationStatus.NOT_CHECKED.value,
-                        ]
+                and_(
+                    Invoice.is_verified.is_(False),
+                    or_(
+                        Invoice.processing_status == ProcessingStatus.FAILED.value,
+                        Invoice.validation_status.in_(
+                            [
+                                ValidationStatus.FAILED.value,
+                                ValidationStatus.WARNING.value,
+                                ValidationStatus.NOT_CHECKED.value,
+                            ]
+                        ),
                     ),
                 )
             )
@@ -796,7 +833,17 @@ def dashboard_stats(
             session.scalar(
                 select(func.count())
                 .select_from(Invoice)
-                .where(Invoice.validation_status == status_value.value)
+                .where(
+                    or_(
+                        Invoice.validation_status == status_value.value,
+                        Invoice.is_verified.is_(True),
+                    )
+                    if status_value == ValidationStatus.PASSED
+                    else and_(
+                        Invoice.validation_status == status_value.value,
+                        Invoice.is_verified.is_(False),
+                    )
+                )
             )
             or 0
         )

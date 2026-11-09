@@ -1,6 +1,6 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -23,3 +23,13 @@ def get_db() -> Generator[Session, None, None]:
 
 def create_database_tables() -> None:
     Base.metadata.create_all(bind=engine)
+    if "is_verified" not in {
+        column["name"] for column in inspect(engine).get_columns("invoices")
+    }:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE invoices "
+                    "ADD COLUMN is_verified BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )

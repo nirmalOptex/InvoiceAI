@@ -13,7 +13,6 @@ import {
   CircleCheck,
   Clock3,
   CloudUpload,
-  Download,
   ExternalLink,
   Eye,
   FileCheck2,
@@ -33,12 +32,12 @@ import {
   getHealth,
   getInvoice,
   getInvoiceDocumentUrl,
-  getInvoiceExportUrl,
   getInvoices,
   reprocessInvoice,
   updateInvoice,
   uploadInvoices,
   validateInvoice,
+  verifyInvoice,
   type DashboardStats,
   type FieldEvidence,
   type Invoice,
@@ -146,6 +145,13 @@ function StatusBadge({ status }: { status: ValidationStatus | ProcessingStatus }
   return <span className={"[display:inline-flex] [min-height:20px] [align-items:center] [border:1px_solid_transparent] [border-radius:99px] [padding:0_7px] [font-size:9px] [font-weight:630] [line-height:1] [white-space:nowrap]" + ' ' + tone}>{label}</span>
 }
 
+function displayedValidationStatus(invoice: {
+  is_verified: boolean
+  validation_status: ValidationStatus
+}): ValidationStatus {
+  return invoice.is_verified ? 'PASSED' : invoice.validation_status
+}
+
 function FieldSource({ evidence }: { evidence?: FieldEvidence }) {
   if (!evidence || (!evidence.original_source_text && evidence.page_number == null)) return null
   return (
@@ -207,7 +213,7 @@ function InvoiceTable({
               {!compact && <td>{displayDate('invoice_date' in invoice ? invoice.invoice_date : null)}</td>}
               <td className={"[color:#354156_!important] [font-weight:630] [color:var(--forest)_!important]"}>{displayMoney(invoice.total_amount, invoice.currency)}</td>
               <td><StatusBadge status={invoice.processing_status} /></td>
-              <td><StatusBadge status={invoice.validation_status} /></td>
+              <td><StatusBadge status={displayedValidationStatus(invoice)} /></td>
               <td><button className={"[display:inline-grid] [width:31px] [height:31px] [flex:0_0_auto] [place-items:center] [border:1px_solid_transparent] [border-radius:7px] [background:transparent] [color:#687386] [transition:background_120ms_ease,_border-color_120ms_ease,_color_120ms_ease] [&:hover:not(:disabled)]:[border-color:#e7eaf0] [&:hover:not(:disabled)]:[background:#f7f8fa] [&:hover:not(:disabled)]:[color:#344054] [color:#66746a] [&:hover:not(:disabled)]:[border-color:#dce3d9] [&:hover:not(:disabled)]:[background:#eff3eb] [&:hover:not(:disabled)]:[color:var(--forest)] [width:27px] [height:27px] [color:#8893a3]"} type="button" aria-label="Review invoice" onClick={(event) => { event.stopPropagation(); onOpen(invoice.id) }}><Eye size={16} /></button></td>
             </tr>
           ))}
@@ -356,10 +362,12 @@ function InvoiceReview({
   onClose,
   onSave,
   onValidate,
+  onVerify,
   onReprocess,
   onDelete,
   saving,
   validating,
+  verifying,
   reprocessing,
   deleting,
 }: {
@@ -367,10 +375,12 @@ function InvoiceReview({
   onClose: () => void
   onSave: (correction: InvoiceCorrection) => void
   onValidate: () => void
+  onVerify: () => void
   onReprocess: () => void
   onDelete: () => void
   saving: boolean
   validating: boolean
+  verifying: boolean
   reprocessing: boolean
   deleting: boolean
 }) {
@@ -378,6 +388,18 @@ function InvoiceReview({
   const [dirtyFields, setDirtyFields] = useState<Set<ScalarField>>(() => new Set())
   const [items, setItems] = useState(() => invoice.items.map(draftFromItem))
   const [itemsDirty, setItemsDirty] = useState(false)
+  const [jsonOpen, setJsonOpen] = useState(false)
+
+  useEffect(() => {
+    if (!jsonOpen) return
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setJsonOpen(false)
+    }
+
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [jsonOpen])
 
   function updateField(name: ScalarField, value: string) {
     setValues((current) => ({ ...current, [name]: value }))
@@ -428,6 +450,34 @@ function InvoiceReview({
     ).values(),
   )
   const rawJson = invoice.raw_extraction_json
+  const isPaymentReceipt = rawJson?.document_type === 'payment_receipt'
+  const receiptFieldLabels: Record<string, string> = {
+    policy_number: 'Policy number',
+    policy_owner: 'Policy owner',
+    payment_method: 'Payment method',
+    next_due_date: 'Next due date',
+    account_of: 'Payment for',
+  }
+  const receiptDetails = isPaymentReceipt && rawJson?.receipt_fields
+    && typeof rawJson.receipt_fields === 'object'
+    && !Array.isArray(rawJson.receipt_fields)
+    ? Object.entries(rawJson.receipt_fields)
+      .filter(([name, value]) => name in receiptFieldLabels && typeof value === 'string' && value.trim())
+      .map(([name, value]) => [receiptFieldLabels[name], String(value)] as const)
+    : []
+  const receiptFieldNames = new Set<ScalarField>([
+    'supplier_name',
+    'invoice_number',
+    'currency',
+    'invoice_date',
+    'total_amount',
+  ])
+  const receiptScalarLabels: Partial<Record<ScalarField, string>> = {
+    supplier_name: 'Issuer',
+    invoice_number: 'Receipt / control number',
+    invoice_date: 'Payment date',
+    total_amount: 'Amount received',
+  }
 
   return (
     <div className={"[position:fixed] [inset:0] [z-index:20] [display:flex] [align-items:center] [justify-content:center] [background:rgb(24_33_49_/_42%)] [padding:2px] [backdrop-filter:blur(2px)] [z-index:18] [justify-content:flex-end] [padding:0] [animation:review-backdrop-enter_280ms_ease-out_both] motion-reduce:[animation-duration:1ms]"} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
@@ -437,17 +487,30 @@ function InvoiceReview({
             <button className={"[display:inline-grid] [width:31px] [height:31px] [flex:0_0_auto] [place-items:center] [border:1px_solid_transparent] [border-radius:7px] [background:transparent] [color:#687386] [transition:background_120ms_ease,_border-color_120ms_ease,_color_120ms_ease] [&:hover:not(:disabled)]:[border-color:#e7eaf0] [&:hover:not(:disabled)]:[background:#f7f8fa] [&:hover:not(:disabled)]:[color:#344054] [color:#66746a] [&:hover:not(:disabled)]:[border-color:#dce3d9] [&:hover:not(:disabled)]:[background:#eff3eb] [&:hover:not(:disabled)]:[color:var(--forest)] [display:none] max-[680px]:[display:inline-grid]"} type="button" onClick={onClose} aria-label="Close invoice review"><ChevronLeft size={20} /></button>
             <span className={"[display:grid] [width:35px] [height:35px] [flex:0_0_auto] [place-items:center] [border-radius:9px] [background:#edf4ff] [color:#2764c6] max-[680px]:[display:none] [border-radius:7px] [background:#e8eee1] [color:#55743e]"}><FileText size={18} /></span>
             <div className={"[min-width:0] [&_.eyebrow]:[font-size:8px] [&_h2]:[overflow:hidden] [&_h2]:[margin:4px_0_2px] [&_h2]:[color:#273248] [&_h2]:[font-size:14px] [&_h2]:[font-weight:650] [&_h2]:[letter-spacing:-0.015em] [&_h2]:[text-overflow:ellipsis] [&_h2]:[white-space:nowrap]"}>
-              <span className={"[display:block] [color:#7e899a] [font-size:9px] [font-weight:720] [letter-spacing:0.13em] [color:var(--leaf)] [letter-spacing:0.1em]"}>INVOICE REVIEW · #{invoice.id}</span>
+              <span className={"[display:block] [color:#7e899a] [font-size:9px] [font-weight:720] [letter-spacing:0.13em] [color:var(--leaf)] [letter-spacing:0.1em]"}>{isPaymentReceipt ? 'PAYMENT RECEIPT' : 'INVOICE REVIEW'} · #{invoice.id}</span>
               <h2 id="review-title">{invoice.supplier_name || invoice.original_filename}</h2>
               <span className={"[display:block] [overflow:hidden] [color:#929aaa] [font-size:9px] [text-overflow:ellipsis] [white-space:nowrap]"}>{invoice.original_filename}</span>
             </div>
           </div>
           <div className={"[display:flex] [min-width:0] [align-items:center] [gap:12px] max-[680px]:[gap:7px] max-[680px]:[&_.button]:[width:32px] max-[680px]:[&_.button]:[min-height:32px] max-[680px]:[&_.button]:[overflow:hidden] max-[680px]:[&_.button]:[gap:16px] max-[680px]:[&_.button]:[padding:0_8px] max-[680px]:[&_.button]:[font-size:0]"}>
+            {invoice.is_verified
+              ? <span className={"[display:inline-flex] [min-height:32px] [align-items:center] [gap:6px] [border-radius:6px] [border:1px_solid_#c6ead8] [background:#eefaf4] [padding:0_9px] [color:#147d52] [font-size:10px] [font-weight:650]"}><BadgeCheck size={14} /> Verified</span>
+              : <button className="button inline-flex min-h-8 items-center justify-center gap-2 rounded-md border border-[#d9ef55] bg-[#d9ef55] px-2.5 text-[11px] font-semibold text-[#18342d] transition-colors hover:border-[#c5dd42] hover:bg-[#c5dd42] disabled:cursor-not-allowed disabled:opacity-60" type="button" onClick={onVerify} disabled={verifying || invoice.processing_status !== 'COMPLETED'} aria-label="Mark invoice as verified" title={invoice.processing_status !== 'COMPLETED' ? 'Wait for document processing to finish before verifying' : 'Mark this invoice as verified'}>
+                {verifying ? <LoaderCircle className={"[animation:spin_900ms_linear_infinite]"} size={14} /> : <BadgeCheck size={14} />}
+                <span>Mark verified</span>
+              </button>}
             <button className="button inline-flex min-h-8 items-center justify-center gap-2 rounded-md border border-[#d9ef55] bg-[#d9ef55] px-2.5 text-[11px] font-semibold text-[#18342d] transition-colors hover:border-[#c5dd42] hover:bg-[#c5dd42] disabled:cursor-not-allowed disabled:opacity-60" type="button" onClick={onReprocess} disabled={reprocessing} title="Re-extract the full document and replace current extracted values">
               {reprocessing ? <LoaderCircle className={"[animation:spin_900ms_linear_infinite]"} size={14} /> : <RefreshCw size={14} />}
               {reprocessing ? 'Re-reading…' : 'Re-extract'}
             </button>
-            <a className={"[display:inline-flex] [min-height:37px] [align-items:center] [justify-content:center] [gap:8px] [border:1px_solid_transparent] [border-radius:7px] [padding:0_13px] [font-size:12px] [font-weight:620] [transition:background_130ms_ease,_border-color_130ms_ease,_box-shadow_130ms_ease] [border-color:#e2e6ec] [background:#fff] [color:#465166] [&:hover:not(:disabled)]:[border-color:#cdd3dc] [&:hover:not(:disabled)]:[background:#f9fafb] [border-color:#d8dfd5] [background:var(--panel)] [color:#46564b] [&:hover:not(:disabled)]:[border-color:#bac8b8] [&:hover:not(:disabled)]:[background:#f2f5ee] [min-height:32px] [padding:0_10px] [font-size:11px]"} href={getInvoiceExportUrl(invoice.id)} download><Download size={15} /> Export JSON</a>
+            <button
+              className="button inline-flex min-h-8 items-center justify-center gap-2 rounded-md border border-[#d8dfd5] bg-[var(--panel)] px-2.5 text-[11px] font-semibold text-[#46564b] transition-colors hover:border-[#bac8b8] hover:bg-[#f2f5ee]"
+              type="button"
+              onClick={() => setJsonOpen(true)}
+              aria-label="View invoice JSON"
+            >
+              <Eye size={14} /> View JSON
+            </button>
             <button className={"[display:inline-grid] [width:31px] [height:31px] [flex:0_0_auto] [place-items:center] [border:1px_solid_transparent] [border-radius:7px] [background:transparent] [color:#687386] [transition:background_120ms_ease,_border-color_120ms_ease,_color_120ms_ease] [&:hover:not(:disabled)]:[border-color:#e7eaf0] [&:hover:not(:disabled)]:[background:#f7f8fa] [&:hover:not(:disabled)]:[color:#344054] [color:#66746a] [&:hover:not(:disabled)]:[border-color:#dce3d9] [&:hover:not(:disabled)]:[background:#eff3eb] [&:hover:not(:disabled)]:[color:var(--forest)]"} type="button" onClick={onClose} aria-label="Close"><X size={19} /></button>
           </div>
         </header>
@@ -463,14 +526,16 @@ function InvoiceReview({
 
             <section className={"[min-width:0] [border:1px_solid_#e8ebf0] [border-radius:9px] [background:#fff] [padding:17px] [box-shadow:0_1px_2px_rgb(16_24_40_/_3%)] max-[680px]:[order:1] max-[680px]:[padding:13px]"}>
               <div className={"[display:flex] [align-items:flex-start] [justify-content:space-between] [gap:12px] [margin-bottom:16px] [&_h3]:[margin:0] [&_h3]:[color:#2a354a] [&_h3]:[font-size:12px] [&_h3]:[font-weight:660] [&_p]:[margin:4px_0_0] [&_p]:[color:#939cac] [&_p]:[font-size:9px] [&_p]:[line-height:1.5]"}>
-                <div><h3>Extracted details</h3><p>Review and correct any fields before saving.</p></div>
-                <StatusBadge status={invoice.validation_status} />
+                <div><h3>{isPaymentReceipt ? 'Receipt details' : 'Extracted details'}</h3><p>{isPaymentReceipt ? 'Review the payment information against the receipt.' : 'Review and correct any fields before saving.'}</p></div>
+                {isPaymentReceipt
+                  ? <span className={"[border-radius:99px] [background:#eef4d9] [padding:4px_8px] [color:#536b28] [font-size:9px] [font-weight:620]"}>Payment receipt</span>
+                  : <StatusBadge status={displayedValidationStatus(invoice)} />}
               </div>
               <form onSubmit={save}>
                 <div className={"[display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:11px_12px] max-[680px]:[gap:9px] max-[390px]:[grid-template-columns:1fr]"}>
-                  {scalarFields.map((field) => (
+                  {scalarFields.filter((field) => !isPaymentReceipt || receiptFieldNames.has(field.name)).map((field) => (
                     <label className={`[display:grid] [min-width:0] [gap:5px] [color:#667286] [font-size:9px] [font-weight:580] [&_input]:[width:100%] [&_input]:[min-width:0] [&_input]:[height:33px] [&_input]:[border:1px_solid_#e1e6ed] [&_input]:[border-radius:6px] [&_input]:[outline:none] [&_input]:[background:#fff] [&_input]:[padding:0_9px] [&_input]:[color:#354156] [&_input]:[font-size:10px] [&_input]:[font-weight:450] [&_input]:[transition:border-color_120ms_ease,_box-shadow_120ms_ease] [&_input:focus]:[border-color:#73a0ec] [&_input:focus]:[box-shadow:0_0_0_3px_rgb(46_112_218_/_10%)] [&_input:focus]:[border-color:#819a68] [&_input:focus]:[box-shadow:0_0_0_3px_rgb(91_125_62_/_10%)] ${field.wide ? '[grid-column:1_/_-1] max-[390px]:[grid-column:auto]' : ''}`} key={field.name}>
-                      <span>{field.label}</span>
+                      <span>{isPaymentReceipt ? receiptScalarLabels[field.name] ?? field.label : field.label}</span>
                       <input
                         type={field.type}
                         step={field.type === 'number' ? 'any' : undefined}
@@ -483,6 +548,7 @@ function InvoiceReview({
                   ))}
                 </div>
 
+                {!isPaymentReceipt && <>
                 <div className={"[&_h3]:[margin:0] [&_h3]:[color:#2a354a] [&_h3]:[font-size:12px] [&_h3]:[font-weight:660] [&_p]:[margin:4px_0_0] [&_p]:[color:#939cac] [&_p]:[font-size:9px] [&_p]:[line-height:1.5] [display:flex] [align-items:center] [justify-content:space-between] [gap:10px] [margin:21px_0_10px]"}>
                   <div><h3>Line items</h3><p>Update item details to recalculate validation.</p></div>
                   <button className={"[display:inline-flex] [min-height:37px] [align-items:center] [justify-content:center] [gap:8px] [border:1px_solid_transparent] [border-radius:7px] [padding:0_13px] [font-size:12px] [font-weight:620] [transition:background_130ms_ease,_border-color_130ms_ease,_box-shadow_130ms_ease] [border-color:#e2e6ec] [background:#fff] [color:#465166] [&:hover:not(:disabled)]:[border-color:#cdd3dc] [&:hover:not(:disabled)]:[background:#f9fafb] [border-color:#d8dfd5] [background:var(--panel)] [color:#46564b] [&:hover:not(:disabled)]:[border-color:#bac8b8] [&:hover:not(:disabled)]:[background:#f2f5ee] [min-height:32px] [padding:0_10px] [font-size:11px]"} type="button" onClick={() => { setItems((current) => [...current, emptyDraft()]); setItemsDirty(true) }}><Plus size={15} /> Add item</button>
@@ -502,16 +568,31 @@ function InvoiceReview({
                     </div>
                   ))}
                 </div>
+                </>}
                 <div className={"[display:flex] [align-items:center] [justify-content:space-between] [gap:10px] [margin-top:15px] [border-top:1px_solid_#eff1f4] [padding-top:13px] max-[680px]:[align-items:flex-end] max-[680px]:[&_.muted-copy]:[max-width:130px]"}>
-                  <span className={"[color:#939cac] [font-size:9px] [line-height:1.5]"}>Changes recalculate financial checks.</span>
+                  <span className={"[color:#939cac] [font-size:9px] [line-height:1.5]"}>{isPaymentReceipt ? 'Save any corrections to the receipt details.' : 'Changes recalculate financial checks.'}</span>
                   <button className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-[#d9ef55] bg-[#d9ef55] px-3 text-xs font-semibold text-[#18342d] shadow-sm transition-colors hover:border-[#c5dd42] hover:bg-[#c5dd42] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#9ab62f] disabled:cursor-not-allowed disabled:opacity-60" type="submit" disabled={saving || (dirtyFields.size === 0 && !itemsDirty)}>
-                    {saving ? <><LoaderCircle className={"[animation:spin_900ms_linear_infinite]"} size={16} /> Saving…</> : <><Check size={16} /> Save corrections</>}
+                    {saving ? <><LoaderCircle className={"[animation:spin_900ms_linear_infinite]"} size={16} /> Saving…</> : <><Check size={16} /> {isPaymentReceipt ? 'Save receipt details' : 'Save corrections'}</>}
                   </button>
                 </div>
               </form>
             </section>
 
-            <section className={"[min-width:0] [border:1px_solid_#e8ebf0] [border-radius:9px] [background:#fff] [padding:17px] [box-shadow:0_1px_2px_rgb(16_24_40_/_3%)] max-[680px]:[order:1] max-[680px]:[padding:13px] validation-card"}>
+            {isPaymentReceipt && receiptDetails.length > 0 && (
+              <section className={"[min-width:0] [border:1px_solid_#e8ebf0] [border-radius:9px] [background:#fff] [padding:17px] [box-shadow:0_1px_2px_rgb(16_24_40_/_3%)] max-[680px]:[order:1] max-[680px]:[padding:13px]"}>
+                <h3 className={"[margin:0_0_12px] [color:#2a354a] [font-size:12px] [font-weight:660]"}>Policy and payment information</h3>
+                <dl className={"[display:grid] [grid-template-columns:repeat(2,_minmax(0,_1fr))] [gap:12px] max-[390px]:[grid-template-columns:1fr]"}>
+                  {receiptDetails.map(([label, value]) => (
+                    <div className={"[display:grid] [gap:4px]"} key={label}>
+                      <dt className={"[color:#78827b] [font-size:9px] [font-weight:580]"}>{label}</dt>
+                      <dd className={"[m-0] [color:#354156] [font-size:10px]"}>{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
+            )}
+
+            {!isPaymentReceipt && <section className={"[min-width:0] [border:1px_solid_#e8ebf0] [border-radius:9px] [background:#fff] [padding:17px] [box-shadow:0_1px_2px_rgb(16_24_40_/_3%)] max-[680px]:[order:1] max-[680px]:[padding:13px] validation-card"}>
               <div className={"[display:flex] [align-items:flex-start] [justify-content:space-between] [gap:12px] [margin-bottom:16px] [&_h3]:[margin:0] [&_h3]:[color:#2a354a] [&_h3]:[font-size:12px] [&_h3]:[font-weight:660] [&_p]:[margin:4px_0_0] [&_p]:[color:#939cac] [&_p]:[font-size:9px] [&_p]:[line-height:1.5]"}>
                 <div><h3>Validation checks</h3><p>Deterministic checks for invoice amounts and required data.</p></div>
                 <button className={"[display:inline-flex] [min-height:37px] [align-items:center] [justify-content:center] [gap:8px] [border:1px_solid_transparent] [border-radius:7px] [padding:0_13px] [font-size:12px] [font-weight:620] [transition:background_130ms_ease,_border-color_130ms_ease,_box-shadow_130ms_ease] [border-color:#e2e6ec] [background:#fff] [color:#465166] [&:hover:not(:disabled)]:[border-color:#cdd3dc] [&:hover:not(:disabled)]:[background:#f9fafb] [border-color:#d8dfd5] [background:var(--panel)] [color:#46564b] [&:hover:not(:disabled)]:[border-color:#bac8b8] [&:hover:not(:disabled)]:[background:#f2f5ee] [min-height:32px] [padding:0_10px] [font-size:11px]"} type="button" onClick={onValidate} disabled={validating}>
@@ -534,7 +615,7 @@ function InvoiceReview({
               ) : (
                 <div className={"[display:flex] [align-items:center] [gap:8px] [border-top:1px_solid_#f0f2f5] [padding-top:14px] [color:#8490a1] [font-size:10px]"}><Clock3 size={17} /><span>No validation results yet. Run checks to review this invoice.</span></div>
               )}
-            </section>
+            </section>}
 
             {ocrLines.length > 0 && (
               <details className={"[min-width:0] [border:1px_solid_#e8ebf0] [border-radius:9px] [background:#fff] [padding:17px] [box-shadow:0_1px_2px_rgb(16_24_40_/_3%)] max-[680px]:[order:1] max-[680px]:[padding:13px] [padding:0] [&_summary]:[display:flex] [&_summary]:[min-height:48px] [&_summary]:[align-items:center] [&_summary]:[justify-content:space-between] [&_summary]:[gap:10px] [&_summary]:[cursor:pointer] [&_summary]:[list-style:none] [&_summary]:[padding:0_16px] [&_summary]:[color:#667286] [&_summary]:[font-size:10px] [&_summary::-webkit-details-marker]:[display:none] [&_summary_>_span:first-child]:[display:flex] [&_summary_>_span:first-child]:[align-items:center] [&_summary_>_span:first-child]:[gap:8px] [&_summary_>_span:first-child]:[color:#3b4960] [&_summary_>_span:first-child]:[font-weight:620] [&_summary_>_span:last-child]:[color:#98a1af] [&_summary_>_span:last-child]:[font-size:9px]"}>
@@ -583,6 +664,37 @@ function InvoiceReview({
           </aside>
         </div>
       </section>
+      {jsonOpen && (
+        <div
+          className={"[position:fixed] [inset:0] [z-index:30] [display:grid] [place-items:center] [background:rgb(24_33_49_/_48%)] [padding:20px]"}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setJsonOpen(false)
+          }}
+        >
+          <section
+            className={"[display:flex] [width:min(100%,_760px)] [max-height:min(85vh,_900px)] [flex-direction:column] [overflow:hidden] [border:1px_solid_#dfe5dc] [border-radius:12px] [background:#fff] [box-shadow:0_24px_70px_rgb(16_24_40_/_24%)]"}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="invoice-json-title"
+          >
+            <header className={"[display:flex] [min-height:56px] [align-items:center] [justify-content:space-between] [gap:12px] [border-bottom:1px_solid_#e8ebf0] [padding:0_16px]"}>
+              <div>
+                <h3 id="invoice-json-title" className={"[margin:0] [color:#273248] [font-size:13px] [font-weight:650]"}>Extraction payload</h3>
+                <p className={"[margin:3px_0_0] [color:#8993a3] [font-size:10px]"}>Raw JSON returned by the extraction provider.</p>
+              </div>
+              <button
+                className={"[display:grid] [width:31px] [height:31px] [place-items:center] [border:0] [border-radius:7px] [background:transparent] [color:#66746a] [&:hover]:[background:#eff3eb] [&:hover]:[color:var(--forest)]"}
+                type="button"
+                onClick={() => setJsonOpen(false)}
+                aria-label="Close JSON viewer"
+              >
+                <X size={18} />
+              </button>
+            </header>
+            <pre className={"[min-height:0] [margin:0] [overflow:auto] [background:#f8faf7] [padding:16px] [color:#344054] [font-family:ui-monospace,_SFMono-Regular,_Consolas,_monospace] [font-size:11px] [line-height:1.6] [white-space:pre-wrap] [overflow-wrap:anywhere]"}>{rawJson ? JSON.stringify(rawJson, null, 2) : 'No extraction payload is available for this invoice yet.'}</pre>
+          </section>
+        </div>
+      )}
     </div>
   )
 }
@@ -817,6 +929,17 @@ function App() {
       setNotice('Validation checks completed.')
     },
   })
+  const verifyMutation = useMutation({
+    mutationFn: () => verifyInvoice(selectedId!),
+    onSuccess: async (invoice) => {
+      queryClient.setQueryData(['invoice', invoice.id], invoice)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['invoices'] }),
+      ])
+      setNotice('Invoice marked as verified.')
+    },
+  })
   const reprocessMutation = useMutation({
     mutationFn: () => reprocessInvoice(selectedId!),
     onSuccess: async (invoice) => {
@@ -842,12 +965,13 @@ function App() {
     },
   })
 
-  const actionError = saveMutation.error ?? validateMutation.error ?? reprocessMutation.error ?? deleteMutation.error
+  const actionError = saveMutation.error ?? validateMutation.error ?? verifyMutation.error ?? reprocessMutation.error ?? deleteMutation.error
 
   function openInvoice(id: number) {
     setSelectedId(id)
     saveMutation.reset()
     validateMutation.reset()
+    verifyMutation.reset()
     reprocessMutation.reset()
     deleteMutation.reset()
   }
@@ -856,6 +980,7 @@ function App() {
     setSelectedId(null)
     saveMutation.reset()
     validateMutation.reset()
+    verifyMutation.reset()
     reprocessMutation.reset()
     deleteMutation.reset()
   }
@@ -912,13 +1037,14 @@ function App() {
           : selectedQuery.error ? <div className={"[position:fixed] [inset:0] [z-index:20] [display:flex] [align-items:center] [justify-content:center] [background:rgb(24_33_49_/_42%)] [padding:22px] [backdrop-filter:blur(2px)] [z-index:18] [justify-content:flex-end] [padding:0] [animation:review-backdrop-enter_280ms_ease-out_both] motion-reduce:[animation-duration:1ms]"} onMouseDown={(event) => { if (event.target === event.currentTarget) closeReview() }}><div className={"[display:flex] [align-items:flex-start] [gap:12px] [border:1px_solid_#f1cdcd] [border-radius:10px] [background:#fff7f6] [padding:18px] [color:#bd3b3b] [margin:auto] [background:#fff] [box-shadow:0_12px_40px_rgb(16_24_40_/_14%)] [position:relative] [display:grid] [width:min(100%,_360px)] [justify-items:start] [gap:10px] [border-color:#e8ebf0] [color:#c14444] [&_.icon-button]:[position:absolute] [&_.icon-button]:[top:8px] [&_.icon-button]:[right:8px] [&_strong]:[color:#344054] [&_strong]:[font-size:13px] [&_span]:[color:#788295] [&_span]:[font-size:11px]"}><button className={"[display:inline-grid] [width:31px] [height:31px] [flex:0_0_auto] [place-items:center] [border:1px_solid_transparent] [border-radius:7px] [background:transparent] [color:#687386] [transition:background_120ms_ease,_border-color_120ms_ease,_color_120ms_ease] [&:hover:not(:disabled)]:[border-color:#e7eaf0] [&:hover:not(:disabled)]:[background:#f7f8fa] [&:hover:not(:disabled)]:[color:#344054] [color:#66746a] [&:hover:not(:disabled)]:[border-color:#dce3d9] [&:hover:not(:disabled)]:[background:#eff3eb] [&:hover:not(:disabled)]:[color:var(--forest)]"} type="button" onClick={closeReview} aria-label="Close"><X size={18} /></button><CircleAlert size={22} /><strong>Couldn’t open this invoice</strong><span>{selectedQuery.error.message}</span><button className={"[display:inline-flex] [min-height:37px] [align-items:center] [justify-content:center] [gap:8px] [border:1px_solid_transparent] [border-radius:7px] [padding:0_13px] [font-size:12px] [font-weight:620] [transition:background_130ms_ease,_border-color_130ms_ease,_box-shadow_130ms_ease] [border-color:#e2e6ec] [background:#fff] [color:#465166] [&:hover:not(:disabled)]:[border-color:#cdd3dc] [&:hover:not(:disabled)]:[background:#f9fafb] [border-color:#d8dfd5] [background:var(--panel)] [color:#46564b] [&:hover:not(:disabled)]:[border-color:#bac8b8] [&:hover:not(:disabled)]:[background:#f2f5ee]"} type="button" onClick={() => void selectedQuery.refetch()}>Try again</button></div></div>
             : selectedQuery.data ? (
               <>
-                {actionError && <div className={"[position:fixed] [z-index:25] [top:78px] [right:24px] [display:flex] [max-width:min(480px,_calc(100vw_-_32px))] [align-items:flex-start] [gap:9px] [border:1px_solid_#efcdcc] [border-radius:8px] [background:#fff7f6] [padding:10px_12px] [color:#b63d3d] [box-shadow:0_5px_18px_rgb(16_24_40_/_10%)] [font-size:10px] [line-height:1.5] [&_span]:[flex:1] [&_button]:[display:grid] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[background:transparent] [&_button]:[color:#a66565]"}><CircleAlert size={16} /><span>{actionError.message}</span><button type="button" onClick={() => { saveMutation.reset(); validateMutation.reset(); deleteMutation.reset() }} aria-label="Dismiss error"><X size={15} /></button></div>}
+                {actionError && <div className={"[position:fixed] [z-index:25] [top:78px] [right:24px] [display:flex] [max-width:min(480px,_calc(100vw_-_32px))] [align-items:flex-start] [gap:9px] [border:1px_solid_#efcdcc] [border-radius:8px] [background:#fff7f6] [padding:10px_12px] [color:#b63d3d] [box-shadow:0_5px_18px_rgb(16_24_40_/_10%)] [font-size:10px] [line-height:1.5] [&_span]:[flex:1] [&_button]:[display:grid] [&_button]:[place-items:center] [&_button]:[border:0] [&_button]:[background:transparent] [&_button]:[color:#a66565]"}><CircleAlert size={16} /><span>{actionError.message}</span><button type="button" onClick={() => { saveMutation.reset(); validateMutation.reset(); verifyMutation.reset(); reprocessMutation.reset(); deleteMutation.reset() }} aria-label="Dismiss error"><X size={15} /></button></div>}
                 <InvoiceReview
                   key={`${selectedId}-${reviewRevision}-${selectedQuery.data.processing_status}`}
                   invoice={selectedQuery.data}
                   onClose={closeReview}
                   onSave={(correction) => saveMutation.mutate(correction)}
                   onValidate={() => validateMutation.mutate()}
+                  onVerify={() => verifyMutation.mutate()}
                   onReprocess={() => {
                     if (window.confirm('Re-extract the full document? This replaces all current extracted values, including unsaved edits.')) {
                       reprocessMutation.mutate()
@@ -927,6 +1053,7 @@ function App() {
                   onDelete={() => { if (window.confirm('Delete this invoice and its stored document? This cannot be undone.')) deleteMutation.mutate() }}
                   saving={saveMutation.isPending}
                   validating={validateMutation.isPending}
+                  verifying={verifyMutation.isPending}
                   reprocessing={reprocessMutation.isPending || selectedQuery.data.processing_status === 'PROCESSING' || selectedQuery.data.processing_status === 'PENDING'}
                   deleting={deleteMutation.isPending}
                 />

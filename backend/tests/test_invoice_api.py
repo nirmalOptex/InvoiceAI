@@ -192,6 +192,7 @@ def test_reprocess_reuses_the_stored_document(
     )
     assert uploaded.status_code == 201
     invoice = _wait_for_processing(api_client, uploaded.json()["id"])
+    assert api_client.post(f"/api/invoices/{invoice['id']}/verify").json()["is_verified"]
 
     queued: list[tuple[int, str, Settings]] = []
     monkeypatch.setattr(
@@ -206,6 +207,7 @@ def test_reprocess_reuses_the_stored_document(
 
     assert response.status_code == 202
     assert response.json()["processing_status"] == "PROCESSING"
+    assert response.json()["is_verified"] is False
     assert response.json()["processing_error"] is None
     assert response.json()["validation_status"] == "PENDING"
     assert len(queued) == 1
@@ -439,6 +441,79 @@ def test_patch_marks_corrections_and_revalidates(
     assert body["field_evidence"]["total_amount"]["manually_corrected"] is True
     assert body["validation_status"] == "FAILED"
     assert any(item["check_name"] == "grand_total" for item in body["validation_results"])
+
+
+def test_verify_invoice_persists_manual_review_status(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _upload_mock(monkeypatch, _extraction_result())
+    uploaded = api_client.post(
+        "/api/invoices/upload",
+        files={"file": ("invoice.png", _png_bytes(), "image/png")},
+    ).json()
+    invoice = _wait_for_processing(api_client, uploaded["id"])
+    assert invoice["is_verified"] is False
+
+    failed_validation = api_client.patch(
+        f"/api/invoices/{uploaded['id']}",
+        json={"total_amount": "115.00"},
+    )
+    assert failed_validation.status_code == 200
+    assert failed_validation.json()["validation_status"] == "FAILED"
+
+    response = api_client.post(f"/api/invoices/{uploaded['id']}/verify")
+
+    assert response.status_code == 200
+    assert response.json()["is_verified"] is True
+    assert response.json()["validation_status"] == "FAILED"
+    assert api_client.get("/api/invoices").json()["items"][0]["is_verified"] is True
+    assert api_client.get(
+        "/api/invoices", params={"validation_status": "PASSED"}
+    ).json()["total"] == 1
+    assert api_client.get(
+        "/api/invoices", params={"validation_status": "FAILED"}
+    ).json()["total"] == 0
+    stats = api_client.get("/api/dashboard/stats").json()
+    assert stats["successfully_validated"] == 1
+    assert stats["validation_distribution"]["passed"] == 1
+    assert stats["validation_distribution"]["failed"] == 0
+    assert stats["needs_review"] == 0
+
+    corrected = api_client.patch(
+        f"/api/invoices/{uploaded['id']}",
+        json={"supplier_name": "Corrected Supplier"},
+    )
+    assert corrected.status_code == 200
+    assert corrected.json()["is_verified"] is False
+    stats = api_client.get("/api/dashboard/stats").json()
+    assert stats["successfully_validated"] == 0
+    assert stats["validation_distribution"]["failed"] == 1
+
+
+def test_verify_invoice_rejects_incomplete_processing(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnstartedThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(invoice_api, "Thread", UnstartedThread)
+    uploaded = api_client.post(
+        "/api/invoices/upload",
+        files={"file": ("invoice.png", _png_bytes(), "image/png")},
+    )
+    invoice_id = uploaded.json()["id"]
+
+    response = api_client.post(f"/api/invoices/{invoice_id}/verify")
+
+    assert uploaded.status_code == 201
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Only completed invoices can be marked as verified."
 
 
 def test_validate_endpoint_replaces_saved_check_results(

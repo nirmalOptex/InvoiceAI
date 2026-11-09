@@ -59,6 +59,7 @@ export interface Invoice {
   processing_status: ProcessingStatus
   processing_error: string | null
   validation_status: ValidationStatus
+  is_verified: boolean
   raw_extraction_json: Record<string, unknown> | null
   extraction_metadata: {
     source_type?: string
@@ -89,6 +90,7 @@ export interface InvoiceListItem {
   processing_status: ProcessingStatus
   processing_error: string | null
   validation_status: ValidationStatus
+  is_verified: boolean
   created_at: string
 }
 
@@ -120,6 +122,7 @@ export interface DashboardStats {
     total_amount: Money
     processing_status: ProcessingStatus
     validation_status: ValidationStatus
+    is_verified: boolean
     created_at: string
   }>
 }
@@ -237,6 +240,10 @@ export function updateInvoice(id: number, correction: InvoiceCorrection): Promis
 
 export function validateInvoice(id: number): Promise<{ invoice_id: number }> {
   return request(`/api/invoices/${id}/validate`, { method: 'POST' })
+}
+
+export function verifyInvoice(id: number): Promise<Invoice> {
+  return request(`/api/invoices/${id}/verify`, { method: 'POST' })
 }
 
 export function reprocessInvoice(id: number): Promise<Invoice> {
