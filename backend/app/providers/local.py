@@ -37,6 +37,7 @@ _CURRENCIES = re.compile(
     r"\b(NPR|USD|EUR|GBP|INR|CAD|AUD|JPY|CNY|CHF|AED|SGD|NZD)\b",
     re.IGNORECASE,
 )
+_ELBOW_ANGLE_DIMENSION = re.compile(r"\b(elbow)\s+(90)(?=\d{2,}\s*mm\b)", re.I)
 _PAGE_LINE = re.compile(
     r"^\[Page\s+(\d+)(?:\s+x1=([\d.]+)\s+y1=([\d.]+)"
     r"\s+x2=([\d.]+)\s+y2=([\d.]+))?\]\s*(.*)$"
@@ -237,7 +238,7 @@ def _in_item_table(record: _OCRRecord, records: list[_OCRRecord]) -> bool:
     columns = _table_columns(records)
     if columns is None or record.center_y is None:
         return False
-    header_y, _ = columns
+    header_y, _, _ = columns
     summary_y = [
         candidate.center_y
         for candidate in records
@@ -303,7 +304,13 @@ def _row_quantity(value: str) -> tuple[str | None, str | None]:
     )
 
 
-def _table_columns(records: list[_OCRRecord]) -> tuple[float, list[float]] | None:
+def _normalize_item_description(value: str) -> str:
+    return _ELBOW_ANGLE_DIMENSION.sub(r"\1 \2° ", value)
+
+
+def _table_columns(
+    records: list[_OCRRecord],
+) -> tuple[float, float, list[float]] | None:
     description_headers = [
         record for record in records if re.fullmatch(r"\s*description\s*", record.text, re.I)
     ]
@@ -341,10 +348,14 @@ def _table_columns(records: list[_OCRRecord]) -> tuple[float, list[float]] | Non
             centers.append(closest.center_x)
         if matched:
             centers.sort()
-            return description.center_y, [
-                (centers[index] + centers[index + 1]) / 2
-                for index in range(len(centers) - 1)
-            ]
+            return (
+                description.center_y,
+                description.x1 or 0,
+                [
+                    (centers[index] + centers[index + 1]) / 2
+                    for index in range(len(centers) - 1)
+                ],
+            )
     return None
 
 
@@ -354,7 +365,7 @@ def _extract_items(
     columns = _table_columns(records)
     if columns is None:
         return []
-    header_y, boundaries = columns
+    header_y, description_left, boundaries = columns
     summary_y_values = [
         record.center_y
         for record in records
@@ -394,7 +405,7 @@ def _extract_items(
         line_total: Decimal | None = None
         for record in row:
             center_x = record.center_x
-            if center_x is None:
+            if center_x is None or center_x < description_left:
                 continue
             if center_x < boundaries[0]:
                 if not re.fullmatch(r"\d{1,2}", record.text.strip()):
@@ -406,7 +417,7 @@ def _extract_items(
             else:
                 line_total = line_total or _parse_amount(record.text)
 
-        description = " ".join(description_parts).strip()
+        description = _normalize_item_description(" ".join(description_parts).strip())
         quantity, unit = _row_quantity(quantity_text) if quantity_text else (None, None)
         if not description or (unit_price is None and line_total is None):
             continue
@@ -434,12 +445,22 @@ def _infer_supplier_header(records: list[_OCRRecord]) -> tuple[str | None, str |
     )
     if bill_to is None or bill_to.center_y is None:
         return None, None
+    supplier_left = (
+        max(0, bill_to.x1 - 100) if bill_to.x1 is not None else None
+    )
     header = [
         record
         for record in records
         if record.center_y is not None
         and record.center_y < bill_to.center_y
-        and (record.center_x is None or record.center_x < 300)
+        and (
+            record.center_x is None
+            or (
+                record.center_x >= supplier_left
+                if supplier_left is not None
+                else record.center_x < 300
+            )
+        )
     ]
     if not header:
         return None, None
@@ -473,7 +494,10 @@ def _infer_supplier_header(records: list[_OCRRecord]) -> tuple[str | None, str |
     )
     if street_index is None:
         return supplier, None
-    address_parts = [header[street_index].text.strip()]
+    street = re.sub(
+        r"(?<=\d)(?=[A-Za-z])", " ", header[street_index].text.strip()
+    )
+    address_parts = [street]
     for record in header[street_index + 1 :]:
         if record.center_y is None or header[street_index].center_y is None:
             break
@@ -482,6 +506,8 @@ def _infer_supplier_header(records: list[_OCRRecord]) -> tuple[str | None, str |
         if re.search(r"\b(?:kathmandu|nepal|city|[0-9]{5,})\b", record.text, re.I):
             locality = re.sub(r"(?<=[A-Za-z])(?=\d{4,}\b)", " ", record.text.strip())
             locality = re.sub(r",(?=[A-Za-z])", ", ", locality)
+            if re.search(r"\bKathmandu\b", locality, re.I):
+                locality = re.sub(r"\bNepa$", "Nepal", locality, flags=re.I)
             address_parts.append(locality)
     return supplier, ", ".join(address_parts)
 
@@ -572,7 +598,7 @@ class LocalRuleBasedProvider:
 
         for record in records:
             tax_line = re.match(
-                r"^\s*(?:VAT|GST|sales\s+tax|tax)\b"
+                r"^\s*(?:VAT|GST|sales\s+tax|tax)"
                 r"(?!\s+(?:(?:registration\s*)?(?:ID|number|no\.?))|"
                 r"\s+amount\b)(.*)$",
                 record.text,
@@ -616,6 +642,10 @@ class LocalRuleBasedProvider:
                 "Supplier address was inferred from the document header; confirm it manually."
             )
 
+        if any(_ELBOW_ANGLE_DIMENSION.search(record.text) for record in records):
+            self.warnings.append(
+                "A 90-degree elbow marker was inferred from OCR; confirm the item description."
+            )
         data["items"] = _extract_items(records, data["currency"])
         if not data["items"]:
             self.warnings.append(

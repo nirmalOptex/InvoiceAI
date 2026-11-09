@@ -589,6 +589,39 @@ def get_invoice(
     return _invoice_or_404(session, invoice_id)
 
 
+@router.post(
+    "/invoices/{invoice_id}/reprocess",
+    response_model=InvoiceRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def reprocess_invoice(
+    invoice_id: int,
+    session: Annotated[Session, Depends(get_db)],
+) -> Invoice:
+    invoice = _invoice_or_404(session, invoice_id)
+    if invoice.processing_status in {
+        ProcessingStatus.PENDING.value,
+        ProcessingStatus.PROCESSING.value,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This invoice is already being processed.",
+        )
+
+    settings = get_settings()
+    storage_dir = Path(settings.storage_dir).resolve()
+    stored_path = (storage_dir / invoice.stored_filename).resolve()
+    if stored_path.parent != storage_dir or not stored_path.is_file():
+        raise HTTPException(status_code=404, detail="Invoice document is unavailable.")
+
+    invoice.processing_status = ProcessingStatus.PROCESSING.value
+    invoice.processing_error = None
+    invoice.validation_status = ValidationStatus.PENDING.value
+    session.commit()
+    _queue_invoice_processing(invoice.id, invoice.stored_filename, settings)
+    return _invoice_or_404(session, invoice_id)
+
+
 @router.get("/invoices/{invoice_id}/document")
 def get_invoice_document(
     invoice_id: int,

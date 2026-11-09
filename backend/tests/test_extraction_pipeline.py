@@ -359,6 +359,89 @@ def test_local_provider_extracts_labeled_invoice_fields_without_api() -> None:
     )
 
 
+def test_local_provider_uses_invoice_geometry_in_mixed_content_image() -> None:
+    records = [
+        (20, 11, 76, 39, "Hello,"),
+        (875, 99, 1205, 122, "RIVERTECH SUPPLIES LTD"),
+        (872, 152, 1037, 173, "45Industrial Estate Road"),
+        (872, 173, 1035, 189, "Kathmandu 44600,Nepa"),
+        (870, 270, 926, 293, "Bill To:"),
+        (1221, 315, 1296, 333, "Invoice No:"),
+        (1344, 314, 1435, 331, "RT-2024-1052"),
+        (1221, 342, 1309, 360, "Invoice Date:"),
+        (1342, 342, 1451, 360, "14 October 2024"),
+        (1221, 371, 1286, 389, "Due Date:"),
+        (1342, 370, 1469, 390, "13 November 2024"),
+        (915, 459, 1002, 475, "Description"),
+        (1145, 451, 1213, 481, "Quantity"),
+        (1254, 443, 1328, 469, "Unit Price"),
+        (1374, 448, 1470, 466, "Total Amount"),
+        (98, 475, 707, 499, "Read the attached invoice image"),
+        (912, 499, 1117, 520, "HDPE Pipe 110mm (6m length)"),
+        (1155, 499, 1206, 522, "50 pcs"),
+        (1280, 501, 1338, 518, "1,250.00"),
+        (1406, 501, 1474, 518, "62,500.00"),
+        (98, 506, 717, 530, "Use an AI tool of your choice"),
+        (914, 533, 1075, 554, "HDPE Elbow 90110mm"),
+        (1155, 529, 1209, 557, "20 pcs"),
+        (1290, 531, 1341, 554, "450.00"),
+        (1414, 534, 1475, 552, "9,000.00"),
+        (99, 558, 350, 579, "Extract the following information"),
+        (914, 565, 1070, 586, "HDPE Coupling 110mm"),
+        (1155, 565, 1206, 587, "30 pcs"),
+        (1286, 565, 1341, 588, "300.00"),
+        (1413, 565, 1477, 587, "9,000.00"),
+        (136, 581, 264, 602, "Invoice date"),
+        (912, 595, 1023, 621, "Welding Service"),
+        (1155, 597, 1205, 619, "10 hrs"),
+        (1277, 597, 1341, 619, "1,500.00"),
+        (1406, 600, 1474, 618, "15,000.00"),
+        (128, 624, 256, 645, "Supplier name"),
+        (911, 629, 1023, 655, "Delivery Charge"),
+        (1163, 632, 1198, 651, "1 lot"),
+        (1277, 630, 1341, 653, "5,000.00"),
+        (1413, 630, 1475, 653, "5,000.00"),
+        (1152, 667, 1256, 690, "Subtotal (NPR)"),
+        (1398, 669, 1474, 686, "100,500.00"),
+        (1154, 702, 1226, 720, "VAT13%"),
+        (1405, 702, 1474, 720, "13,065.00"),
+        (1154, 736, 1298, 757, "Total Amount (NPR)"),
+        (1389, 738, 1472, 755, "113,565.00"),
+    ]
+    ocr_text = "\n".join(
+        f"[Page 1 x1={x1} y1={y1} x2={x2} y2={y2}] {text}"
+        for x1, y1, x2, y2, text in records
+    )
+
+    provider = LocalRuleBasedProvider()
+    data = provider.extract([], ocr_text)
+
+    assert data["supplier_name"] == "Rivertech Supplies Ltd"
+    assert data["supplier_address"] == "45 Industrial Estate Road, Kathmandu 44600, Nepal"
+    assert data["invoice_number"] == "RT-2024-1052"
+    assert data["invoice_date"] == "14 October 2024"
+    assert data["due_date"] == "13 November 2024"
+    assert data["subtotal"] == "100500.00"
+    assert data["tax_rate"] == "13"
+    assert data["tax_amount"] == "13065.00"
+    assert data["total_amount"] == "113565.00"
+    assert [item["description"] for item in data["items"]] == [
+        "HDPE Pipe 110mm (6m length)",
+        "HDPE Elbow 90° 110mm",
+        "HDPE Coupling 110mm",
+        "Welding Service",
+        "Delivery Charge",
+    ]
+    assert any("90-degree elbow marker" in warning for warning in provider.warnings)
+    assert [item["line_total"] for item in data["items"]] == [
+        "62500.00",
+        "9000.00",
+        "9000.00",
+        "15000.00",
+        "5000.00",
+    ]
+
+
 def test_local_provider_rejects_empty_ocr_text() -> None:
     with pytest.raises(ProviderError, match="no readable OCR text"):
         LocalRuleBasedProvider().extract([], "")

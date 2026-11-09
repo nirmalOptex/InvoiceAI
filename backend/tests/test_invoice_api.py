@@ -181,6 +181,65 @@ def test_upload_runs_local_extraction_without_external_provider(
     )
 
 
+def test_reprocess_reuses_the_stored_document(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _upload_mock(monkeypatch, _extraction_result())
+    uploaded = api_client.post(
+        "/api/invoices/upload",
+        files={"file": ("invoice.png", _png_bytes(), "image/png")},
+    )
+    assert uploaded.status_code == 201
+    invoice = _wait_for_processing(api_client, uploaded.json()["id"])
+
+    queued: list[tuple[int, str, Settings]] = []
+    monkeypatch.setattr(
+        invoice_api,
+        "_queue_invoice_processing",
+        lambda invoice_id, filename, settings: queued.append(
+            (invoice_id, filename, settings)
+        ),
+    )
+
+    response = api_client.post(f"/api/invoices/{invoice['id']}/reprocess")
+
+    assert response.status_code == 202
+    assert response.json()["processing_status"] == "PROCESSING"
+    assert response.json()["processing_error"] is None
+    assert response.json()["validation_status"] == "PENDING"
+    assert len(queued) == 1
+    assert queued[0][0] == invoice["id"]
+    assert queued[0][1].endswith(".png")
+
+
+def test_reprocess_rejects_an_invoice_already_processing(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _upload_mock(monkeypatch, _extraction_result())
+    uploaded = api_client.post(
+        "/api/invoices/upload",
+        files={"file": ("invoice.png", _png_bytes(), "image/png")},
+    )
+    invoice_id = uploaded.json()["id"]
+    _wait_for_processing(api_client, invoice_id)
+    queued: list[int] = []
+    monkeypatch.setattr(
+        invoice_api,
+        "_queue_invoice_processing",
+        lambda invoice_id, filename, settings: queued.append(invoice_id),
+    )
+    first = api_client.post(f"/api/invoices/{invoice_id}/reprocess")
+
+    assert first.status_code == 202
+    second = api_client.post(f"/api/invoices/{invoice_id}/reprocess")
+
+    assert second.status_code == 409
+    assert second.json()["detail"] == "This invoice is already being processed."
+    assert queued == [invoice_id]
+
+
 def test_bulk_upload_returns_while_each_invoice_processes_in_background(
     api_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

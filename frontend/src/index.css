@@ -19,8 +19,8 @@
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
+  --primary: #d9ef55;
+  --primary-foreground: #18342d;
   --secondary: oklch(0.97 0 0);
   --secondary-foreground: oklch(0.205 0 0);
   --muted: oklch(0.97 0 0);
@@ -108,8 +108,8 @@ a {
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
+  --primary: #d9ef55;
+  --primary-foreground: #18342d;
   --secondary: oklch(0.269 0 0);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0 0);
@@ -145,4 +145,61 @@ a {
   html {
     @apply font-sans;
   }
+}
+
+:root {
+  --ink: #1d2925;
+  --muted: #78827b;
+  --line: #dfe5dc;
+  --paper: #f5f7f2;
+  --panel: #fbfcf8;
+  --forest: #18342d;
+  --forest-soft: #24463c;
+  --citrus: #d9ef55;
+  --leaf: #5b7d3e;
+}
+
+#root { min-height: 100vh; }
+button, input, select { font: inherit; }
+button { cursor: pointer; white-space: nowrap; }
+button:disabled { cursor: not-allowed; opacity: 0.58; }
+a { color: inherit; text-decoration: none; }
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes upload-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes upload-dialog-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes upload-dropzone-in {
+  from { opacity: 0; transform: translateY(9px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes upload-icon-in {
+  from { opacity: 0; transform: scale(0.82); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes review-backdrop-enter {
+  from { background-color: rgb(25 34 31 / 0%); }
+  to { background-color: rgb(25 34 31 / 42%); }
+}
+
+@keyframes review-panel-enter {
+  from { opacity: 0.7; transform: translateX(28px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }

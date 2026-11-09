@@ -239,6 +239,10 @@ export function validateInvoice(id: number): Promise<{ invoice_id: number }> {
   return request(`/api/invoices/${id}/validate`, { method: 'POST' })
 }
 
+export function reprocessInvoice(id: number): Promise<Invoice> {
+  return request(`/api/invoices/${id}/reprocess`, { method: 'POST' })
+}
+
 export function deleteInvoice(id: number): Promise<void> {
   return request(`/api/invoices/${id}`, { method: 'DELETE' })
 }
