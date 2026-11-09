@@ -29,7 +29,7 @@ class ProcessedDocument:
     source_type: str
 
 
-def _safe_filename(filename: str) -> str:
+def safe_filename(filename: str) -> str:
     name = filename.replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
     if not name or name in {".", ".."}:
@@ -120,7 +120,7 @@ def process_document(
     if render_dpi < 72 or render_dpi > 300:
         raise ValueError("render_dpi must be between 72 and 300.")
 
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     suffix = "." + safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
     if suffix == ".pdf":
         pages = _process_pdf(content, max_pages, render_dpi)

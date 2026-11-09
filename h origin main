@@ -1,0 +1,1811 @@
+warning: in the working copy of 'frontend/index.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/index.css', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/backend/app/api/invoices.py b/backend/app/api/invoices.py[m
+[1mindex 8e4ac09..c35ea34 100644[m
+[1m--- a/backend/app/api/invoices.py[m
+[1m+++ b/backend/app/api/invoices.py[m
+[36m@@ -1,20 +1,24 @@[m
+ from __future__ import annotations[m
+ [m
+ import mimetypes[m
+[32m+[m[32mimport logging[m
+ import os[m
+ import tempfile[m
+[32m+[m[32mfrom concurrent.futures import ThreadPoolExecutor[m
+[32m+[m[32mfrom threading import Thread[m
+[32m+[m[32mfrom time import perf_counter[m
+ import uuid[m
+ from decimal import Decimal[m
+ from pathlib import Path[m
+ from typing import Annotated, Any, cast[m
+ [m
+[31m-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status[m
+[32m+[m[32mfrom fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status[m
+ from fastapi.responses import FileResponse, JSONResponse[m
+ from sqlalchemy import func, or_, select[m
+ from sqlalchemy.orm import Session, selectinload[m
+ [m
+ from app.config import Settings, get_settings[m
+[31m-from app.database import get_db[m
+[32m+[m[32mfrom app.database import SessionLocal, get_db[m
+ from app.models import Invoice, InvoiceItem, ValidationResult[m
+ from app.schemas.invoice import ([m
+     DashboardStats,[m
+[36m@@ -28,17 +32,22 @@[m [mfrom app.schemas.invoice import ([m
+     ValidationRunResponse,[m
+     ValidationStatus,[m
+ )[m
+[31m-from app.services.document_processing import DocumentProcessingError[m
+[32m+[m[32mfrom app.services.document_processing import DocumentProcessingError, safe_filename[m
+ from app.services.extraction_pipeline import ExtractionResult, extract_document[m
+ from app.services.validator import validate_invoice[m
+ [m
+ router = APIRouter(prefix="/api", tags=["invoices"])[m
+[32m+[m[32mlogger = logging.getLogger(__name__)[m
+ ALLOWED_CONTENT_TYPES = {[m
+     ".pdf": "application/pdf",[m
+     ".png": "image/png",[m
+     ".jpg": "image/jpeg",[m
+     ".jpeg": "image/jpeg",[m
+ }[m
+[32m+[m[32mMAX_BULK_UPLOAD_FILES = 10[m
+[32m+[m[32m_processing_executor = ThreadPoolExecutor([m
+[32m+[m[32m    max_workers=4, thread_name_prefix="invoice-processing"[m
+[32m+[m[32m)[m
+ SORT_COLUMNS = {[m
+     "created_at": Invoice.created_at,[m
+     "invoice_date": Invoice.invoice_date,[m
+[36m@@ -94,7 +103,7 @@[m [mdef _read_upload(upload: UploadFile, maximum_bytes: int) -> bytes:[m
+     return b"".join(chunks)[m
+ [m
+ [m
+[31m-def _validate_upload_type(upload: UploadFile) -> None:[m
+[32m+[m[32mdef _validate_upload_type(upload: UploadFile, content: bytes | None = None) -> None:[m
+     filename = upload.filename or ""[m
+     suffix = Path(filename.replace("\\", "/").rsplit("/", 1)[-1]).suffix.lower()[m
+     expected_type = ALLOWED_CONTENT_TYPES.get(suffix)[m
+[36m@@ -111,6 +120,24 @@[m [mdef _validate_upload_type(upload: UploadFile) -> None:[m
+             detail="The declared MIME type does not match the filename extension.",[m
+         )[m
+ [m
+[32m+[m[32m    if content is None:[m
+[32m+[m[32m        return[m
+[32m+[m[32m    if suffix == ".pdf" and not content.startswith(b"%PDF-"):[m
+[32m+[m[32m        raise HTTPException([m
+[32m+[m[32m            status_code=422,[m
+[32m+[m[32m            detail="The file extension does not match a PDF document.",[m
+[32m+[m[32m        )[m
+[32m+[m[32m    if suffix == ".png" and not content.startswith(b"\x89PNG\r\n\x1a\n"):[m
+[32m+[m[32m        raise HTTPException([m
+[32m+[m[32m            status_code=422,[m
+[32m+[m[32m            detail="The file extension does not match a PNG image.",[m
+[32m+[m[32m        )[m
+[32m+[m[32m    if suffix in {".jpg", ".jpeg"} and not content.startswith(b"\xff\xd8\xff"):[m
+[32m+[m[32m        raise HTTPException([m
+[32m+[m[32m            status_code=422,[m
+[32m+[m[32m            detail="The file extension does not match a JPEG image.",[m
+[32m+[m[32m        )[m
+[32m+[m
+ [m
+ def _store_document(content: bytes, filename: str, settings: Settings) -> str:[m
+     suffix = Path(filename).suffix.lower()[m
+[36m@@ -234,79 +261,52 @@[m [mdef _refresh_validation(invoice: Invoice, session: Session, settings: Settings)[m
+     session.flush()[m
+ [m
+ [m
+[31m-@router.post([m
+[31m-    "/invoices/upload",[m
+[31m-    response_model=InvoiceRead,[m
+[31m-    status_code=status.HTTP_201_CREATED,[m
+[31m-)[m
+[31m-def upload_invoice([m
+[31m-    file: Annotated[UploadFile, File()],[m
+[31m-    session: Annotated[Session, Depends(get_db)],[m
+[31m-) -> Invoice:[m
+[31m-    settings = get_settings()[m
+[31m-    _validate_upload_type(file)[m
+[31m-    content = _read_upload(file, settings.max_upload_size_mb * 1024 * 1024)[m
+[31m-    filename = file.filename or ""[m
+[31m-    try:[m
+[31m-        result = extract_document([m
+[31m-            content,[m
+[31m-            filename,[m
+[31m-            settings=settings,[m
+[31m-        )[m
+[31m-    except DocumentProcessingError as exc:[m
+[31m-        code = 413 if "size limit" in str(exc) else 422[m
+[31m-        raise HTTPException(status_code=code, detail=str(exc)) from exc[m
+[31m-    except ValueError as exc:[m
+[31m-        raise HTTPException(status_code=422, detail=str(exc)) from exc[m
+[31m-[m
+[31m-    stored_filename = _store_document(content, result.filename, settings)[m
+[32m+[m[32mdef _apply_extraction_result(invoice: Invoice, result: ExtractionResult) -> None:[m
+     extracted = result.invoice[m
+[31m-    invoice_values: dict[str, Any] = {}[m
+     if extracted is not None:[m
+         invoice_values = extracted.model_dump([m
+             mode="python",[m
+             exclude={"items", "field_evidence"},[m
+         )[m
+[31m-    invoice = Invoice([m
+[31m-        original_filename=result.filename,[m
+[31m-        stored_filename=stored_filename,[m
+[31m-        **invoice_values,[m
+[31m-        processing_status=([m
+[31m-            ProcessingStatus.COMPLETED.value[m
+[31m-            if extracted is not None[m
+[31m-            else ProcessingStatus.FAILED.value[m
+[31m-        ),[m
+[31m-        processing_error=result.error,[m
+[31m-        validation_status=([m
+[31m-            result.validation.status.value[m
+[31m-            if result.validation is not None[m
+[31m-            else ValidationStatus.NOT_CHECKED.value[m
+[31m-        ),[m
+[31m-        raw_extraction_json=result.raw_extraction,[m
+[31m-        extraction_metadata={[m
+[31m-            "source_type": result.source_type,[m
+[31m-            "page_count": result.page_count,[m
+[31m-            "provider": result.provider,[m
+[31m-            "warnings": result.warnings,[m
+[31m-            "ocr_lines": [[m
+[31m-                {[m
+[31m-                    "text": line.text,[m
+[31m-                    "page_number": line.page_number,[m
+[31m-                    "bounding_box": line.bounding_box,[m
+[31m-                    "confidence": line.confidence,[m
+[31m-                }[m
+[31m-                for line in result.ocr_lines[m
+[31m-            ],[m
+[31m-        },[m
+[31m-        field_evidence=([m
+[32m+[m[32m        for field, value in invoice_values.items():[m
+[32m+[m[32m            setattr(invoice, field, value)[m
+[32m+[m
+[32m+[m[32m    invoice.processing_status = ([m
+[32m+[m[32m        ProcessingStatus.COMPLETED.value[m
+[32m+[m[32m        if extracted is not None[m
+[32m+[m[32m        else ProcessingStatus.FAILED.value[m
+[32m+[m[32m    )[m
+[32m+[m[32m    invoice.processing_error = result.error[m
+[32m+[m[32m    invoice.validation_status = ([m
+[32m+[m[32m        result.validation.status.value[m
+[32m+[m[32m        if result.validation is not None[m
+[32m+[m[32m        else ValidationStatus.NOT_CHECKED.value[m
+[32m+[m[32m    )[m
+[32m+[m[32m    invoice.raw_extraction_json = result.raw_extraction[m
+[32m+[m[32m    invoice.extraction_metadata = {[m
+[32m+[m[32m        "source_type": result.source_type,[m
+[32m+[m[32m        "page_count": result.page_count,[m
+[32m+[m[32m        "provider": result.provider,[m
+[32m+[m[32m        "warnings": result.warnings,[m
+[32m+[m[32m        "ocr_lines": [[m
+             {[m
+[31m-                name: evidence.model_dump(mode="json")[m
+[31m-                for name, evidence in extracted.field_evidence.items()[m
+[32m+[m[32m                "text": line.text,[m
+[32m+[m[32m                "page_number": line.page_number,[m
+[32m+[m[32m                "bounding_box": line.bounding_box,[m
+[32m+[m[32m                "confidence": line.confidence,[m
+             }[m
+[31m-            if extracted is not None[m
+[31m-            else {}[m
+[31m-        ),[m
+[32m+[m[32m            for line in result.ocr_lines[m
+[32m+[m[32m        ],[m
+[32m+[m[32m    }[m
+[32m+[m[32m    invoice.field_evidence = ([m
+[32m+[m[32m        {[m
+[32m+[m[32m            name: evidence.model_dump(mode="json")[m
+[32m+[m[32m            for name, evidence in extracted.field_evidence.items()[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if extracted is not None[m
+[32m+[m[32m        else {}[m
+     )[m
+[32m+[m[32m    invoice.items.clear()[m
+     if extracted is not None:[m
+         for item in extracted.items:[m
+             invoice.items.append([m
+[36m@@ -322,14 +322,130 @@[m [mdef upload_invoice([m
+                     manually_corrected=False,[m
+                 )[m
+             )[m
+[32m+[m[32m    invoice.validation_results.clear()[m
+     if result.validation is not None:[m
+[31m-        _record_validation_results(invoice, result.validation.checks)[m
+[32m+[m[32m        for check in result.validation.checks:[m
+[32m+[m[32m            invoice.validation_results.append([m
+[32m+[m[32m                ValidationResult([m
+[32m+[m[32m                    check_name=check.check_name,[m
+[32m+[m[32m                    expected_value=check.expected_value,[m
+[32m+[m[32m                    actual_value=check.actual_value,[m
+[32m+[m[32m                    difference=check.difference,[m
+[32m+[m[32m                    status=check.status.value,[m
+[32m+[m[32m                    message=check.message,[m
+[32m+[m[32m                )[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _set_processing_failure(invoice_id: int, message: str) -> None:[m
+[32m+[m[32m    with SessionLocal() as session:[m
+[32m+[m[32m        invoice = session.get(Invoice, invoice_id)[m
+[32m+[m[32m        if invoice is None:[m
+[32m+[m[32m            return[m
+[32m+[m[32m        invoice.processing_status = ProcessingStatus.FAILED.value[m
+[32m+[m[32m        invoice.processing_error = message[m
+[32m+[m[32m        invoice.validation_status = ValidationStatus.NOT_CHECKED.value[m
+[32m+[m[32m        session.commit()[m
+[32m+[m
+ [m
+[32m+[m[32mdef _process_uploaded_invoice([m
+[32m+[m[32m    invoice_id: int, stored_filename: str, settings: Settings[m
+[32m+[m[32m) -> None:[m
+[32m+[m[32m    total_started = perf_counter()[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        with SessionLocal() as session:[m
+[32m+[m[32m            invoice = session.get(Invoice, invoice_id)[m
+[32m+[m[32m            if invoice is None:[m
+[32m+[m[32m                return[m
+[32m+[m[32m            filename = invoice.original_filename[m
+[32m+[m
+[32m+[m[32m        storage_dir = Path(settings.storage_dir).resolve()[m
+[32m+[m[32m        stored_path = (storage_dir / stored_filename).resolve()[m
+[32m+[m[32m        if stored_path.parent != storage_dir:[m
+[32m+[m[32m            raise OSError("Stored invoice path is invalid.")[m
+[32m+[m[32m        content = stored_path.read_bytes()[m
+[32m+[m[32m        result = extract_document(content, filename, settings=settings)[m
+[32m+[m
+[32m+[m[32m        with SessionLocal() as session:[m
+[32m+[m[32m            invoice = session.scalar([m
+[32m+[m[32m                select(Invoice)[m
+[32m+[m[32m                .options([m
+[32m+[m[32m                    selectinload(Invoice.items),[m
+[32m+[m[32m                    selectinload(Invoice.validation_results),[m
+[32m+[m[32m                )[m
+[32m+[m[32m                .where(Invoice.id == invoice_id)[m
+[32m+[m[32m            )[m
+[32m+[m[32m            if invoice is None:[m
+[32m+[m[32m                return[m
+[32m+[m[32m            _apply_extraction_result(invoice, result)[m
+[32m+[m[32m            session.commit()[m
+[32m+[m
+[32m+[m[32m        logger.info([m
+[32m+[m[32m            "Invoice processing timings: %s",[m
+[32m+[m[32m            {[m
+[32m+[m[32m                "invoice_id": invoice_id,[m
+[32m+[m[32m                "file_bytes": len(content),[m
+[32m+[m[32m                "page_count": result.page_count,[m
+[32m+[m[32m                "provider": result.provider,[m
+[32m+[m[32m                "stage_timings_ms": result.stage_timings_ms,[m
+[32m+[m[32m                "background_total_ms": round((perf_counter() - total_started) * 1000, 1),[m
+[32m+[m[32m            },[m
+[32m+[m[32m        )[m
+[32m+[m[32m    except (DocumentProcessingError, ValueError) as exc:[m
+[32m+[m[32m        _set_processing_failure(invoice_id, str(exc))[m
+[32m+[m[32m        logger.warning([m
+[32m+[m[32m            "Invoice processing failed: %s",[m
+[32m+[m[32m            {"invoice_id": invoice_id, "background_total_ms": round((perf_counter() - total_started) * 1000, 1)},[m
+[32m+[m[32m        )[m
+[32m+[m[32m    except Exception:[m
+[32m+[m[32m        logger.exception("Invoice processing failed unexpectedly (invoice_id=%s)", invoice_id)[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            _set_processing_failure(invoice_id, "Invoice processing failed unexpectedly.")[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            logger.exception("Could not mark invoice processing failure (invoice_id=%s)", invoice_id)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _queue_invoice_processing([m
+[32m+[m[32m    invoice_id: int, stored_filename: str, settings: Settings[m
+[32m+[m[32m) -> None:[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        _processing_executor.submit([m
+[32m+[m[32m            _process_uploaded_invoice, invoice_id, stored_filename, settings[m
+[32m+[m[32m        )[m
+[32m+[m[32m    except RuntimeError:[m
+[32m+[m[32m        _set_processing_failure(invoice_id, "Invoice processing is unavailable.")[m
+[32m+[m
+[32m+[m
+[32m+[m[32m@router.post([m
+[32m+[m[32m    "/invoices/upload",[m
+[32m+[m[32m    response_model=InvoiceRead,[m
+[32m+[m[32m    status_code=status.HTTP_201_CREATED,[m
+[32m+[m[32m)[m
+[32m+[m[32mdef upload_invoice([m
+[32m+[m[32m    file: Annotated[UploadFile, File()],[m
+[32m+[m[32m    background_tasks: BackgroundTasks,[m
+[32m+[m[32m    session: Annotated[Session, Depends(get_db)],[m
+[32m+[m[32m) -> Invoice:[m
+[32m+[m[32m    settings = get_settings()[m
+[32m+[m[32m    content = _read_upload(file, settings.max_upload_size_mb * 1024 * 1024)[m
+[32m+[m[32m    _validate_upload_type(file, content)[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        filename = safe_filename(file.filename or "")[m
+[32m+[m[32m    except DocumentProcessingError as exc:[m
+[32m+[m[32m        raise HTTPException(status_code=422, detail=str(exc)) from exc[m
+[32m+[m[32m    stored_filename = _store_document(content, filename, settings)[m
+[32m+[m[32m    invoice = Invoice([m
+[32m+[m[32m        original_filename=filename,[m
+[32m+[m[32m        stored_filename=stored_filename,[m
+[32m+[m[32m        processing_status=ProcessingStatus.PROCESSING.value,[m
+[32m+[m[32m        validation_status=ValidationStatus.PENDING.value,[m
+[32m+[m[32m        extraction_metadata={},[m
+[32m+[m[32m        field_evidence={},[m
+[32m+[m[32m    )[m
+     try:[m
+         session.add(invoice)[m
+         session.commit()[m
+         session.refresh(invoice)[m
+[31m-        return invoice[m
+     except Exception:[m
+         session.rollback()[m
+         try:[m
+[36m@@ -340,6 +456,82 @@[m [mdef upload_invoice([m
+                 detail="Invoice persistence failed and stored-file cleanup also failed.",[m
+             ) from cleanup_error[m
+         raise[m
+[32m+[m[32m    thread = Thread([m
+[32m+[m[32m        target=_process_uploaded_invoice,[m
+[32m+[m[32m        args=(invoice.id, stored_filename, settings),[m
+[32m+[m[32m        daemon=True,[m
+[32m+[m[32m        name=f"invoice-processing-{invoice.id}",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    thread.start()[m
+[32m+[m[32m    return invoice[m
+[32m+[m
+[32m+[m
+[32m+[m[32m@router.post([m
+[32m+[m[32m    "/invoices/bulk-upload",[m
+[32m+[m[32m    response_model=list[InvoiceRead],[m
+[32m+[m[32m    status_code=status.HTTP_202_ACCEPTED,[m
+[32m+[m[32m)[m
+[32m+[m[32mdef upload_invoices([m
+[32m+[m[32m    files: Annotated[list[UploadFile], File()],[m
+[32m+[m[32m    session: Annotated[Session, Depends(get_db)],[m
+[32m+[m[32m) -> list[Invoice]:[m
+[32m+[m[32m    if not files:[m
+[32m+[m[32m        raise HTTPException(status_code=422, detail="Choose at least one invoice.")[m
+[32m+[m[32m    if len(files) > MAX_BULK_UPLOAD_FILES:[m
+[32m+[m[32m        raise HTTPException([m
+[32m+[m[32m            status_code=413,[m
+[32m+[m[32m            detail=f"Upload no more than {MAX_BULK_UPLOAD_FILES} invoices at a time.",[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    settings = get_settings()[m
+[32m+[m[32m    prepared: list[tuple[str, bytes]] = [][m
+[32m+[m[32m    for upload in files:[m
+[32m+[m[32m        content = _read_upload(upload, settings.max_upload_size_mb * 1024 * 1024)[m
+[32m+[m[32m        _validate_upload_type(upload, content)[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            filename = safe_filename(upload.filename or "")[m
+[32m+[m[32m        except DocumentProcessingError as exc:[m
+[32m+[m[32m            raise HTTPException(status_code=422, detail=str(exc)) from exc[m
+[32m+[m[32m        prepared.append((filename, content))[m
+[32m+[m
+[32m+[m[32m    stored_files: list[str] = [][m
+[32m+[m[32m    try:[m
+[32m+[m[32m        for filename, content in prepared:[m
+[32m+[m[32m            stored_files.append(_store_document(content, filename, settings))[m
+[32m+[m
+[32m+[m[32m        invoices = [[m
+[32m+[m[32m            Invoice([m
+[32m+[m[32m                original_filename=filename,[m
+[32m+[m[32m                stored_filename=stored_filename,[m
+[32m+[m[32m                processing_status=ProcessingStatus.PROCESSING.value,[m
+[32m+[m[32m                validation_status=ValidationStatus.PENDING.value,[m
+[32m+[m[32m                extraction_metadata={},[m
+[32m+[m[32m                field_evidence={},[m
+[32m+[m[32m            )[m
+[32m+[m[32m            for (filename, _), stored_filename in zip(prepared, stored_files)[m
+[32m+[m[32m        ][m
+[32m+[m[32m        session.add_all(invoices)[m
+[32m+[m[32m        session.commit()[m
+[32m+[m[32m        for invoice in invoices:[m
+[32m+[m[32m            session.refresh(invoice)[m
+[32m+[m[32m    except Exception:[m
+[32m+[m[32m        session.rollback()[m
+[32m+[m[32m        cleanup_errors = [][m
+[32m+[m[32m        for stored_filename in stored_files:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                _delete_stored_document(stored_filename, settings)[m
+[32m+[m[32m            except HTTPException as cleanup_error:[m
+[32m+[m[32m                cleanup_errors.append(cleanup_error)[m
+[32m+[m[32m        if cleanup_errors:[m
+[32m+[m[32m            raise HTTPException([m
+[32m+[m[32m                status_code=500,[m
+[32m+[m[32m                detail="Invoice batch persistence failed and stored-file cleanup also failed.",[m
+[32m+[m[32m            ) from cleanup_errors[0][m
+[32m+[m[32m        raise[m
+[32m+[m
+[32m+[m[32m    for invoice in invoices:[m
+[32m+[m[32m        _queue_invoice_processing(invoice.id, invoice.stored_filename, settings)[m
+[32m+[m[32m    return invoices[m
+ [m
+ [m
+ @router.get("/invoices", response_model=InvoicePage)[m
+[1mdiff --git a/backend/app/providers/local.py b/backend/app/providers/local.py[m
+[1mindex a4ec07c..22c1c16 100644[m
+[1m--- a/backend/app/providers/local.py[m
+[1m+++ b/backend/app/providers/local.py[m
+[36m@@ -638,4 +638,5 @@[m [mclass LocalRuleBasedProvider:[m
+                 "the OCR text. Review the OCR and enter details manually."[m
+             )[m
+ [m
+[32m+[m[32m        self.warnings = list(dict.fromkeys(self.warnings))[m
+         return data[m
+[1mdiff --git a/backend/app/services/document_processing.py b/backend/app/services/document_processing.py[m
+[1mindex 8deb7ea..ffd2694 100644[m
+[1m--- a/backend/app/services/document_processing.py[m
+[1m+++ b/backend/app/services/document_processing.py[m
+[36m@@ -29,7 +29,7 @@[m [mclass ProcessedDocument:[m
+     source_type: str[m
+ [m
+ [m
+[31m-def _safe_filename(filename: str) -> str:[m
+[32m+[m[32mdef safe_filename(filename: str) -> str:[m
+     name = filename.replace("\\", "/").rsplit("/", 1)[-1][m
+     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()[m
+     if not name or name in {".", ".."}:[m
+[36m@@ -120,7 +120,7 @@[m [mdef process_document([m
+     if render_dpi < 72 or render_dpi > 300:[m
+         raise ValueError("render_dpi must be between 72 and 300.")[m
+ [m
+[31m-    safe_name = _safe_filename(filename)[m
+[32m+[m[32m    safe_name = safe_filename(filename)[m
+     suffix = "." + safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""[m
+     if suffix == ".pdf":[m
+         pages = _process_pdf(content, max_pages, render_dpi)[m
+[1mdiff --git a/backend/app/services/extraction_pipeline.py b/backend/app/services/extraction_pipeline.py[m
+[1mindex 9177006..df86fb0 100644[m
+[1m--- a/backend/app/services/extraction_pipeline.py[m
+[1m+++ b/backend/app/services/extraction_pipeline.py[m
+[36m@@ -1,6 +1,7 @@[m
+ from __future__ import annotations[m
+ [m
+ from dataclasses import dataclass, field[m
+[32m+[m[32mfrom time import perf_counter[m
+ from typing import Callable[m
+ [m
+ from app.config import Settings, get_settings[m
+[36m@@ -41,6 +42,7 @@[m [mclass ExtractionResult:[m
+     validation: ValidationReport | None = None[m
+     warnings: list[str] = field(default_factory=list)[m
+     error: str | None = None[m
+[32m+[m[32m    stage_timings_ms: dict[str, float] = field(default_factory=dict)[m
+ [m
+ [m
+ def _ocr_context([m
+[36m@@ -73,6 +75,8 @@[m [mdef extract_document([m
+ ) -> ExtractionResult:[m
+     """Run document rendering, OCR, and vision extraction without storing files."""[m
+     config = settings or get_settings()[m
+[32m+[m[32m    total_started = perf_counter()[m
+[32m+[m[32m    stage_started = perf_counter()[m
+     document: ProcessedDocument = process_document([m
+         content,[m
+         filename,[m
+[36m@@ -80,20 +84,30 @@[m [mdef extract_document([m
+         render_dpi=config.document_render_dpi,[m
+         max_file_bytes=config.max_upload_size_mb * 1024 * 1024,[m
+     )[m
+[32m+[m[32m    stage_timings_ms = {[m
+[32m+[m[32m        "document_render_ms": round((perf_counter() - stage_started) * 1000, 1)[m
+[32m+[m[32m    }[m
+     result = ExtractionResult([m
+         filename=document.filename,[m
+         source_type=document.source_type,[m
+         page_count=len(document.pages),[m
+     )[m
+     ocr = ocr_service or PaddleOCRService()[m
+[32m+[m[32m    stage_started = perf_counter()[m
+     try:[m
+         result.ocr_lines = ocr.extract(document.pages)[m
+     except OCRUnavailableError as exc:[m
+         result.warnings.append(str(exc))[m
+[32m+[m[32m    finally:[m
+[32m+[m[32m        stage_timings_ms["ocr_ms"] = round((perf_counter() - stage_started) * 1000, 1)[m
+ [m
+     provider_builder = provider_factory or (lambda: create_vision_provider(config))[m
+     try:[m
+[32m+[m[32m        stage_started = perf_counter()[m
+         provider = provider_builder()[m
+[32m+[m[32m        stage_timings_ms["provider_setup_ms"] = round([m
+[32m+[m[32m            (perf_counter() - stage_started) * 1000, 1[m
+[32m+[m[32m        )[m
+         result.provider = provider.name[m
+         ocr_text, was_truncated = _ocr_context([m
+             result.ocr_lines,[m
+[36m@@ -103,17 +117,34 @@[m [mdef extract_document([m
+             result.warnings.append([m
+                 "OCR text exceeded the vision prompt limit; full OCR remains available for review."[m
+             )[m
+[31m-        raw_data = provider.extract(document.pages, ocr_text)[m
+[32m+[m[32m        stage_started = perf_counter()[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            raw_data = provider.extract(document.pages, ocr_text)[m
+[32m+[m[32m        finally:[m
+[32m+[m[32m            stage_timings_ms["provider_extract_ms"] = round([m
+[32m+[m[32m                (perf_counter() - stage_started) * 1000, 1[m
+[32m+[m[32m            )[m
+         result.raw_extraction = raw_data[m
+         if isinstance(provider, LocalRuleBasedProvider):[m
+             result.warnings.extend(provider.warnings)[m
+[31m-        invoice, normalization_warnings = normalize_extraction(raw_data)[m
+[31m-        result.invoice = attach_ocr_evidence(invoice, result.ocr_lines, provider.name)[m
+[31m-        result.validation = validate_invoice(result.invoice, settings=config)[m
+[31m-        result.warnings.extend(normalization_warnings)[m
+[32m+[m[32m        result.warnings = list(dict.fromkeys(result.warnings))[m
+[32m+[m[32m        stage_started = perf_counter()[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            invoice, normalization_warnings = normalize_extraction(raw_data)[m
+[32m+[m[32m            result.invoice = attach_ocr_evidence(invoice, result.ocr_lines, provider.name)[m
+[32m+[m[32m            result.validation = validate_invoice(result.invoice, settings=config)[m
+[32m+[m[32m            result.warnings.extend(normalization_warnings)[m
+[32m+[m[32m        finally:[m
+[32m+[m[32m            stage_timings_ms["normalize_validate_ms"] = round([m
+[32m+[m[32m                (perf_counter() - stage_started) * 1000, 1[m
+[32m+[m[32m            )[m
+     except (ProviderError, ExtractionNormalizationError) as exc:[m
+         result.error = str(exc)[m
+         result.warnings.append([m
+             "Invoice extraction did not complete; available OCR text is preserved for review."[m
+         )[m
+[32m+[m[32m    result.stage_timings_ms = stage_timings_ms[m
+[32m+[m[32m    result.stage_timings_ms["pipeline_total_ms"] = round([m
+[32m+[m[32m        (perf_counter() - total_started) * 1000, 1[m
+[32m+[m[32m    )[m
+     return result[m
+[1mdiff --git a/backend/tests/test_invoice_api.py b/backend/tests/test_invoice_api.py[m
+[1mindex 8148288..3f567f8 100644[m
+[1m--- a/backend/tests/test_invoice_api.py[m
+[1m+++ b/backend/tests/test_invoice_api.py[m
+[36m@@ -1,16 +1,17 @@[m
+ from __future__ import annotations[m
+ [m
+ import io[m
+[32m+[m[32mimport time[m
+ from datetime import date[m
+ from decimal import Decimal[m
+ from pathlib import Path[m
+[32m+[m[32mfrom threading import Event[m
+ from typing import Iterator[m
+ import pytest[m
+ from fastapi.testclient import TestClient[m
+ from PIL import Image[m
+ from sqlalchemy import create_engine[m
+ from sqlalchemy.orm import Session, sessionmaker[m
+[31m-from sqlalchemy.pool import StaticPool[m
+ [m
+ from app.api import invoices as invoice_api[m
+ from app.config import Settings[m
+[36m@@ -87,9 +88,8 @@[m [mdef _extraction_result(invoice: InvoiceData | None = None) -> ExtractionResult:[m
+ @pytest.fixture[m
+ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:[m
+     engine = create_engine([m
+[31m-        "sqlite://",[m
+[32m+[m[32m        f"sqlite:///{tmp_path / 'test-invoices.db'}",[m
+         connect_args={"check_same_thread": False},[m
+[31m-        poolclass=StaticPool,[m
+     )[m
+     Base.metadata.create_all(engine)[m
+     test_sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)[m
+[36m@@ -103,6 +103,7 @@[m [mdef api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test[m
+         storage_dir=str(tmp_path / "documents"),[m
+         max_upload_size_mb=1,[m
+     )[m
+[32m+[m[32m    monkeypatch.setattr(invoice_api, "SessionLocal", test_sessions)[m
+     monkeypatch.setattr(invoice_api, "get_settings", lambda: settings)[m
+     app.dependency_overrides[get_db] = override_get_db[m
+     client = TestClient(app)[m
+[36m@@ -118,6 +119,17 @@[m [mdef _upload_mock(monkeypatch: pytest.MonkeyPatch, result: ExtractionResult) -> N[m
+     monkeypatch.setattr(invoice_api, "extract_document", lambda *args, **kwargs: result)[m
+ [m
+ [m
+[32m+[m[32mdef _wait_for_processing(api_client: TestClient, invoice_id: int, *, max_attempts: int = 30) -> dict:[m
+[32m+[m[32m    for _ in range(max_attempts):[m
+[32m+[m[32m        response = api_client.get(f"/api/invoices/{invoice_id}")[m
+[32m+[m[32m        assert response.status_code == 200[m
+[32m+[m[32m        body = response.json()[m
+[32m+[m[32m        if body["processing_status"] not in {"PENDING", "PROCESSING"}:[m
+[32m+[m[32m            return body[m
+[32m+[m[32m        time.sleep(0.1)[m
+[32m+[m[32m    return response.json()[m
+[32m+[m
+[32m+[m
+ def test_upload_runs_local_extraction_without_external_provider([m
+     api_client: TestClient,[m
+     monkeypatch: pytest.MonkeyPatch,[m
+[36m@@ -154,16 +166,73 @@[m [mdef test_upload_runs_local_extraction_without_external_provider([m
+ [m
+     assert response.status_code == 201[m
+     body = response.json()[m
+[31m-    assert body["processing_status"] == "COMPLETED"[m
+[31m-    assert body["invoice_number"] == "RT-2024-1052"[m
+[31m-    assert body["total_amount"] == "113565.00"[m
+[31m-    assert body["extraction_metadata"]["provider"] == "local"[m
+[32m+[m[32m    assert body["processing_status"] == "PROCESSING"[m
+[32m+[m[32m    assert body["invoice_number"] is None[m
+[32m+[m[32m    assert body["extraction_metadata"] == {}[m
+[32m+[m
+[32m+[m[32m    completed = _wait_for_processing(api_client, body["id"])[m
+[32m+[m[32m    assert completed["processing_status"] == "COMPLETED"[m
+[32m+[m[32m    assert completed["invoice_number"] == "RT-2024-1052"[m
+[32m+[m[32m    assert completed["total_amount"] == "113565.00"[m
+[32m+[m[32m    assert completed["extraction_metadata"]["provider"] == "local"[m
+     assert any([m
+         "No line items could be reliably matched" in warning[m
+[31m-        for warning in body["extraction_metadata"]["warnings"][m
+[32m+[m[32m        for warning in completed["extraction_metadata"]["warnings"][m
+     )[m
+ [m
+ [m
+[32m+[m[32mdef test_bulk_upload_returns_while_each_invoice_processes_in_background([m
+[32m+[m[32m    api_client: TestClient,[m
+[32m+[m[32m    monkeypatch: pytest.MonkeyPatch,[m
+[32m+[m[32m    tmp_path: Path,[m
+[32m+[m[32m) -> None:[m
+[32m+[m[32m    extraction_started = Event()[m
+[32m+[m[32m    continue_extraction = Event()[m
+[32m+[m
+[32m+[m[32m    def blocked_extraction(*args: object, **kwargs: object) -> ExtractionResult:[m
+[32m+[m[32m        del args, kwargs[m
+[32m+[m[32m        extraction_started.set()[m
+[32m+[m[32m        continue_extraction.wait(timeout=5)[m
+[32m+[m[32m        return _extraction_result()[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(invoice_api, "extract_document", blocked_extraction)[m
+[32m+[m[32m    response = api_client.post([m
+[32m+[m[32m        "/api/invoices/bulk-upload",[m
+[32m+[m[32m        files=[[m
+[32m+[m[32m            ("files", ("first.png", _png_bytes(), "image/png")),[m
+[32m+[m[32m            ("files", ("second.png", _png_bytes(), "image/png")),[m
+[32m+[m[32m        ],[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    assert response.status_code == 202[m
+[32m+[m[32m    invoices = response.json()[m
+[32m+[m[32m    assert len(invoices) == 2[m
+[32m+[m[32m    assert all(invoice["processing_status"] == "PROCESSING" for invoice in invoices)[m
+[32m+[m[32m    assert extraction_started.wait(timeout=1)[m
+[32m+[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        stored_documents = list((tmp_path / "documents").iterdir())[m
+[32m+[m[32m        assert len(stored_documents) == 2[m
+[32m+[m[32m    finally:[m
+[32m+[m[32m        continue_extraction.set()[m
+[32m+[m
+[32m+[m[32m    completed = [_wait_for_processing(api_client, invoice["id"]) for invoice in invoices][m
+[32m+[m[32m    assert all(invoice["processing_status"] == "COMPLETED" for invoice in completed)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_bulk_upload_enforces_file_count_limit(api_client: TestClient) -> None:[m
+[32m+[m[32m    response = api_client.post([m
+[32m+[m[32m        "/api/invoices/bulk-upload",[m
+[32m+[m[32m        files=[[m
+[32m+[m[32m            ("files", (f"invoice-{index}.png", _png_bytes(), "image/png"))[m
+[32m+[m[32m            for index in range(invoice_api.MAX_BULK_UPLOAD_FILES + 1)[m
+[32m+[m[32m        ],[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    assert response.status_code == 413[m
+[32m+[m[32m    assert "no more than" in response.json()["detail"][m
+[32m+[m
+[32m+[m
+ def test_upload_persists_invoice_evidence_and_original_document([m
+     api_client: TestClient,[m
+     tmp_path: Path,[m
+[36m@@ -178,12 +247,16 @@[m [mdef test_upload_persists_invoice_evidence_and_original_document([m
+ [m
+     assert response.status_code == 201[m
+     data = response.json()[m
+[31m-    assert data["invoice_number"] == "RT-2024-1052"[m
+[31m-    assert data["processing_status"] == "COMPLETED"[m
+[31m-    assert data["validation_status"] == "PASSED"[m
+[31m-    assert data["items"][0]["currency"] == "NPR"[m
+[31m-    assert data["field_evidence"]["invoice_number"]["ocr_confidence"] == 0.97[m
+[31m-    assert data["extraction_metadata"]["ocr_lines"][0]["page_number"] == 1[m
+[32m+[m[32m    assert data["processing_status"] == "PROCESSING"[m
+[32m+[m[32m    assert data["invoice_number"] is None[m
+[32m+[m
+[32m+[m[32m    completed = _wait_for_processing(api_client, data["id"])[m
+[32m+[m[32m    assert completed["invoice_number"] == "RT-2024-1052"[m
+[32m+[m[32m    assert completed["processing_status"] == "COMPLETED"[m
+[32m+[m[32m    assert completed["validation_status"] == "PASSED"[m
+[32m+[m[32m    assert completed["items"][0]["currency"] == "NPR"[m
+[32m+[m[32m    assert completed["field_evidence"]["invoice_number"]["ocr_confidence"] == 0.97[m
+[32m+[m[32m    assert completed["extraction_metadata"]["ocr_lines"][0]["page_number"] == 1[m
+     stored_path = next((tmp_path / "documents").iterdir())[m
+     assert stored_path.read_bytes() == _png_bytes()[m
+     assert stored_path.name != "invoice.png"[m
+[36m@@ -210,10 +283,14 @@[m [mdef test_upload_retains_ocr_if_provider_returns_failure([m
+ [m
+     assert response.status_code == 201[m
+     body = response.json()[m
+[31m-    assert body["processing_status"] == "FAILED"[m
+[31m-    assert body["processing_error"] == "GEMINI_API_KEY is not configured."[m
+[31m-    assert body["invoice_number"] is None[m
+[31m-    assert body["extraction_metadata"]["ocr_lines"][0]["text"] == ([m
+[32m+[m[32m    assert body["processing_status"] == "PROCESSING"[m
+[32m+[m[32m    assert body["processing_error"] is None[m
+[32m+[m
+[32m+[m[32m    failed = _wait_for_processing(api_client, body["id"])[m
+[32m+[m[32m    assert failed["processing_status"] == "FAILED"[m
+[32m+[m[32m    assert failed["processing_error"] == "GEMINI_API_KEY is not configured."[m
+[32m+[m[32m    assert failed["invoice_number"] is None[m
+[32m+[m[32m    assert failed["extraction_metadata"]["ocr_lines"][0]["text"] == ([m
+         "Invoice RT-2024-1052"[m
+     )[m
+ [m
+[36m@@ -263,6 +340,7 @@[m [mdef test_invoice_history_search_filter_sort_and_pagination([m
+             files={"file": (f"{index}.png", _png_bytes(), "image/png")},[m
+         )[m
+         assert response.status_code == 201[m
+[32m+[m[32m        _wait_for_processing(api_client, response.json()["id"])[m
+ [m
+     response = api_client.get([m
+         "/api/invoices",[m
+[36m@@ -287,6 +365,9 @@[m [mdef test_patch_marks_corrections_and_revalidates([m
+         files={"file": ("invoice.png", _png_bytes(), "image/png")},[m
+     ).json()[m
+ [m
+[32m+[m[32m    invoice = _wait_for_processing(api_client, uploaded["id"])[m
+[32m+[m[32m    assert invoice["processing_status"] == "COMPLETED"[m
+[32m+[m
+     response = api_client.patch([m
+         f"/api/invoices/{uploaded['id']}",[m
+         json={"total_amount": "115.00", "supplier_name": "Rivertech Supplies Ltd."},[m
+[36m@@ -311,6 +392,8 @@[m [mdef test_validate_endpoint_replaces_saved_check_results([m
+         files={"file": ("invoice.png", _png_bytes(), "image/png")},[m
+     ).json()[m
+ [m
+[32m+[m[32m    _wait_for_processing(api_client, uploaded["id"])[m
+[32m+[m
+     response = api_client.post(f"/api/invoices/{uploaded['id']}/validate")[m
+ [m
+     assert response.status_code == 200[m
+[36m@@ -325,6 +408,8 @@[m [mdef test_invoice_export_and_document_preview(api_client: TestClient, monkeypatch[m
+         files={"file": ("invoice.png", _png_bytes(), "image/png")},[m
+     ).json()[m
+ [m
+[32m+[m[32m    _wait_for_processing(api_client, uploaded["id"])[m
+[32m+[m
+     exported = api_client.get(f"/api/invoices/{uploaded['id']}/export")[m
+     preview = api_client.get(f"/api/invoices/{uploaded['id']}/document")[m
+ [m
+[36m@@ -349,6 +434,8 @@[m [mdef test_dashboard_uses_records_and_groups_values_by_currency([m
+         files={"file": ("invoice.png", _png_bytes(), "image/png")},[m
+     )[m
+     assert uploaded.status_code == 201[m
+[32m+[m[32m    uploaded_body = uploaded.json()[m
+[32m+[m[32m    _wait_for_processing(api_client, uploaded_body["id"])[m
+ [m
+     failed_result = ExtractionResult([m
+         filename="failed.png",[m
+[36m@@ -362,6 +449,8 @@[m [mdef test_dashboard_uses_records_and_groups_values_by_currency([m
+         files={"file": ("failed.png", _png_bytes(), "image/png")},[m
+     )[m
+     assert failed.status_code == 201[m
+[32m+[m[32m    failed_body = failed.json()[m
+[32m+[m[32m    _wait_for_processing(api_client, failed_body["id"])[m
+ [m
+     response = api_client.get("/api/dashboard/stats")[m
+ [m
+[1mdiff --git a/frontend/index.html b/frontend/index.html[m
+[1mindex d3bd9b6..663d430 100644[m
+[1m--- a/frontend/index.html[m
+[1m+++ b/frontend/index.html[m
+[36m@@ -3,6 +3,7 @@[m
+   <head>[m
+     <meta charset="UTF-8" />[m
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />[m
+[32m+[m[32m    <link rel="icon" type="image/svg+xml" href="/invoiceiq-mark.svg" />[m
+     <meta[m
+       name="description"[m
+       content="InvoiceIQ helps teams extract, review, and verify invoice data."[m
+[1mdiff --git a/frontend/src/App.css b/frontend/src/App.css[m
+[1mindex bc62a04..b2eaf1c 100644[m
+[1m--- a/frontend/src/App.css[m
+[1m+++ b/frontend/src/App.css[m
+[36m@@ -949,13 +949,20 @@[m [ma {[m
+   backdrop-filter: blur(2px);[m
+ }[m
+ [m
+[32m+[m[32m.modal-backdrop {[m
+[32m+[m[32m  animation: upload-backdrop-in 220ms ease-out both;[m
+[32m+[m[32m}[m
+[32m+[m
+ .upload-dialog {[m
+[31m-  width: min(100%, 480px);[m
+[32m+[m[32m  width: min(100%, 510px);[m
+[32m+[m[32m  max-height: calc(100dvh - 32px);[m
+[32m+[m[32m  overflow-y: auto;[m
+   border: 1px solid #e8ebf0;[m
+[31m-  border-radius: 12px;[m
+[32m+[m[32m  border-radius: 14px;[m
+   background: #fff;[m
+[31m-  padding: 23px;[m
+[32m+[m[32m  padding: 27px;[m
+   box-shadow: 0 18px 55px rgb(16 24 40 / 20%);[m
+[32m+[m[32m  animation: upload-dialog-in 420ms cubic-bezier(0.2, 0.75, 0.25, 1) both;[m
+ }[m
+ [m
+ .dialog-heading {[m
+[36m@@ -963,7 +970,7 @@[m [ma {[m
+   align-items: flex-start;[m
+   justify-content: space-between;[m
+   gap: 12px;[m
+[31m-  margin-bottom: 19px;[m
+[32m+[m[32m  margin-bottom: 22px;[m
+ }[m
+ [m
+ .dialog-heading h2 {[m
+[36m@@ -981,25 +988,38 @@[m [ma {[m
+ }[m
+ [m
+ .dropzone {[m
+[32m+[m[32m  position: relative;[m
+   display: flex;[m
+[31m-  min-height: 180px;[m
+[32m+[m[32m  min-height: 208px;[m
+   flex-direction: column;[m
+   align-items: center;[m
+   justify-content: center;[m
+[31m-  gap: 9px;[m
+[32m+[m[32m  gap: 13px;[m
+   border: 1px dashed #cbd4e1;[m
+[31m-  border-radius: 9px;[m
+[31m-  background: #fbfcfe;[m
+[31m-  padding: 20px;[m
+[32m+[m[32m  border-radius: 10px;[m
+[32m+[m[32m  background: radial-gradient(circle at 50% 32%, rgb(91 125 62 / 8%), transparent 48%), #fbfcf8;[m
+[32m+[m[32m  padding: 24px;[m
+   text-align: center;[m
+[31m-  transition: border-color 120ms ease, background 120ms ease;[m
+[32m+[m[32m  cursor: pointer;[m
+[32m+[m[32m  transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease, transform 180ms ease;[m
+[32m+[m[32m  animation: upload-dropzone-in 460ms 70ms both;[m
+ }[m
+ [m
+ .dropzone:hover,[m
+ .dropzone-active,[m
+ .dropzone-selected {[m
+[31m-  border-color: #5b8def;[m
+[31m-  background: #f5f8ff;[m
+[32m+[m[32m  border-color: #819a68;[m
+[32m+[m[32m  background: radial-gradient(circle at 50% 32%, rgb(91 125 62 / 12%), transparent 48%), #f4f7ef;[m
+[32m+[m[32m  box-shadow: inset 0 0 0 1px rgb(91 125 62 / 7%);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.dropzone:hover {[m
+[32m+[m[32m  transform: translateY(-2px);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.dropzone:focus-within {[m
+[32m+[m[32m  outline: 3px solid rgb(91 125 62 / 18%);[m
+[32m+[m[32m  outline-offset: 3px;[m
+ }[m
+ [m
+ .dropzone input {[m
+[36m@@ -1014,27 +1034,118 @@[m [ma {[m
+ [m
+ .dropzone-icon {[m
+   display: grid;[m
+[31m-  width: 43px;[m
+[31m-  height: 43px;[m
+[32m+[m[32m  width: 48px;[m
+[32m+[m[32m  height: 48px;[m
+   place-items: center;[m
+[31m-  border: 1px solid #e3eaf5;[m
+[31m-  border-radius: 12px;[m
+[32m+[m[32m  border: 1px solid #e3e9de;[m
+[32m+[m[32m  border-radius: 13px;[m
+   background: #fff;[m
+[31m-  color: #356fd4;[m
+[32m+[m[32m  color: #55743e;[m
+   box-shadow: 0 2px 5px rgb(16 24 40 / 5%);[m
+[32m+[m[32m  animation: upload-icon-in 520ms 100ms cubic-bezier(0.2, 0.75, 0.25, 1) both;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.dropzone-icon-ready {[m
+[32m+[m[32m  border-color: #d7e5cd;[m
+[32m+[m[32m  background: #edf4e8;[m
+[32m+[m[32m  color: #4d7339;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.dropzone-copy {[m
+[32m+[m[32m  display: grid;[m
+[32m+[m[32m  max-width: 100%;[m
+[32m+[m[32m  gap: 5px;[m
+ }[m
+ [m
+[31m-.dropzone strong {[m
+[32m+[m[32m.dropzone-copy strong {[m
+[32m+[m[32m  overflow: hidden;[m
+   color: #435068;[m
+[31m-  font-size: 11px;[m
+[32m+[m[32m  font-size: 12px;[m
+   font-weight: 620;[m
+[32m+[m[32m  text-overflow: ellipsis;[m
+[32m+[m[32m  white-space: nowrap;[m
+ }[m
+ [m
+[31m-.dropzone > span:last-child {[m
+[32m+[m[32m.dropzone-copy > span {[m
+   color: #9aa3b0;[m
+   font-size: 10px;[m
+ }[m
+ [m
+[32m+[m[32m.dropzone-browse {[m
+[32m+[m[32m  display: inline-flex;[m
+[32m+[m[32m  min-height: 29px;[m
+[32m+[m[32m  align-items: center;[m
+[32m+[m[32m  border: 1px solid #dce5d5;[m
+[32m+[m[32m  border-radius: 6px;[m
+[32m+[m[32m  background: #fff;[m
+[32m+[m[32m  padding: 0 11px;[m
+[32m+[m[32m  color: #55743e;[m
+[32m+[m[32m  font-size: 10px;[m
+[32m+[m[32m  font-weight: 620;[m
+[32m+[m[32m  transition: border-color 160ms ease, background 160ms ease;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-list {[m
+[32m+[m[32m  display: grid;[m
+[32m+[m[32m  max-height: 220px;[m
+[32m+[m[32m  gap: 5px;[m
+[32m+[m[32m  overflow-y: auto;[m
+[32m+[m[32m  margin-top: 12px;[m
+[32m+[m[32m  border: 1px solid #e8ede3;[m
+[32m+[m[32m  border-radius: 8px;[m
+[32m+[m[32m  background: #fcfdfa;[m
+[32m+[m[32m  padding: 9px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-list-heading {[m
+[32m+[m[32m  display: flex;[m
+[32m+[m[32m  align-items: center;[m
+[32m+[m[32m  justify-content: space-between;[m
+[32m+[m[32m  gap: 8px;[m
+[32m+[m[32m  padding: 1px 3px 5px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-list-heading strong {[m
+[32m+[m[32m  color: #647064;[m
+[32m+[m[32m  font-size: 9px;[m
+[32m+[m[32m  font-weight: 650;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-row {[m
+[32m+[m[32m  display: grid;[m
+[32m+[m[32m  min-width: 0;[m
+[32m+[m[32m  grid-template-columns: 16px minmax(0, 1fr) auto 28px;[m
+[32m+[m[32m  align-items: center;[m
+[32m+[m[32m  gap: 8px;[m
+[32m+[m[32m  border-top: 1px solid #edf1e9;[m
+[32m+[m[32m  padding: 6px 2px 1px;[m
+[32m+[m[32m  color: #718071;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-row > span {[m
+[32m+[m[32m  overflow: hidden;[m
+[32m+[m[32m  color: #45554a;[m
+[32m+[m[32m  font-size: 10px;[m
+[32m+[m[32m  text-overflow: ellipsis;[m
+[32m+[m[32m  white-space: nowrap;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-row small {[m
+[32m+[m[32m  color: #929e90;[m
+[32m+[m[32m  font-size: 9px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.upload-file-row .icon-button {[m
+[32m+[m[32m  width: 26px;[m
+[32m+[m[32m  height: 26px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.dropzone:hover .dropzone-browse,[m
+[32m+[m[32m.dropzone-active .dropzone-browse {[m
+[32m+[m[32m  border-color: #bfd0b4;[m
+[32m+[m[32m  background: #f8faf5;[m
+[32m+[m[32m}[m
+[32m+[m
+ .text-link {[m
+   color: #175cd3;[m
+ }[m
+[36m@@ -1046,6 +1157,37 @@[m [ma {[m
+   margin-top: 18px;[m
+ }[m
+ [m
+[32m+[m[32m@keyframes upload-backdrop-in {[m
+[32m+[m[32m  from { opacity: 0; }[m
+[32m+[m[32m  to { opacity: 1; }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@keyframes upload-dialog-in {[m
+[32m+[m[32m  from { opacity: 0; transform: translateY(14px) scale(0.985); }[m
+[32m+[m[32m  to { opacity: 1; transform: translateY(0) scale(1); }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@keyframes upload-dropzone-in {[m
+[32m+[m[32m  from { opacity: 0; transform: translateY(9px); }[m
+[32m+[m[32m  to { opacity: 1; transform: translateY(0); }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@keyframes upload-icon-in {[m
+[32m+[m[32m  from { opacity: 0; transform: scale(0.82); }[m
+[32m+[m[32m  to { opacity: 1; transform: scale(1); }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@media (prefers-reduced-motion: reduce) {[m
+[32m+[m[32m  .modal-backdrop,[m
+[32m+[m[32m  .upload-dialog,[m
+[32m+[m[32m  .dropzone,[m
+[32m+[m[32m  .dropzone-icon {[m
+[32m+[m[32m    animation-duration: 1ms;[m
+[32m+[m[32m    animation-delay: 0ms;[m
+[32m+[m[32m    transition-duration: 1ms;[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+ .inline-error {[m
+   display: flex;[m
+   align-items: flex-start;[m
+[36m@@ -1060,16 +1202,19 @@[m [ma {[m
+   z-index: 18;[m
+   justify-content: flex-end;[m
+   padding: 0;[m
+[32m+[m[32m  animation: review-backdrop-enter 280ms ease-out both;[m
+ }[m
+ [m
+ .review-panel {[m
+   display: flex;[m
+[32m+[m[32m  min-width: 0;[m
+   width: min(100%, 1120px);[m
+   height: 100%;[m
+   flex-direction: column;[m
+   overflow: hidden;[m
+   background: #f7f8fa;[m
+   box-shadow: -15px 0 45px rgb(16 24 40 / 14%);[m
+[32m+[m[32m  animation: review-panel-enter 380ms cubic-bezier(0.2, 0.75, 0.25, 1) both;[m
+ }[m
+ [m
+ .review-header {[m
+[36m@@ -1138,6 +1283,7 @@[m [ma {[m
+ [m
+ .review-content {[m
+   display: grid;[m
+[32m+[m[32m  min-width: 0;[m
+   min-height: 0;[m
+   flex: 1;[m
+   grid-template-columns: minmax(0, 1fr) minmax(270px, 37%);[m
+[36m@@ -1148,11 +1294,13 @@[m [ma {[m
+ [m
+ .review-main-column {[m
+   display: grid;[m
+[32m+[m[32m  min-width: 0;[m
+   align-content: start;[m
+   gap: 13px;[m
+ }[m
+ [m
+ .review-card {[m
+[32m+[m[32m  min-width: 0;[m
+   border: 1px solid #e8ebf0;[m
+   border-radius: 9px;[m
+   background: #fff;[m
+[36m@@ -1412,6 +1560,21 @@[m [ma {[m
+   font-size: 8px;[m
+ }[m
+ [m
+[32m+[m[32m.json-card pre {[m
+[32m+[m[32m  margin: 0;[m
+[32m+[m[32m  max-height: 260px;[m
+[32m+[m[32m  overflow: auto;[m
+[32m+[m[32m  border-top: 1px solid #eff1f4;[m
+[32m+[m[32m  background: #f8fafc;[m
+[32m+[m[32m  padding: 12px 16px;[m
+[32m+[m[32m  color: #32435d;[m
+[32m+[m[32m  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;[m
+[32m+[m[32m  font-size: 8px;[m
+[32m+[m[32m  line-height: 1.6;[m
+[32m+[m[32m  white-space: pre-wrap;[m
+[32m+[m[32m  word-break: break-word;[m
+[32m+[m[32m}[m
+[32m+[m
+ .review-danger-zone {[m
+   display: flex;[m
+   align-items: center;[m
+[36m@@ -1515,6 +1678,23 @@[m [ma {[m
+   object-fit: contain;[m
+ }[m
+ [m
+[32m+[m[32m@keyframes review-backdrop-enter {[m
+[32m+[m[32m  from { background-color: rgb(25 34 31 / 0%); }[m
+[32m+[m[32m  to { background-color: rgb(25 34 31 / 42%); }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@keyframes review-panel-enter {[m
+[32m+[m[32m  from { opacity: 0.7; transform: translateX(28px); }[m
+[32m+[m[32m  to { opacity: 1; transform: translateX(0); }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@media (prefers-reduced-motion: reduce) {[m
+[32m+[m[32m  .review-backdrop,[m
+[32m+[m[32m  .review-panel {[m
+[32m+[m[32m    animation-duration: 1ms;[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+ .document-meta {[m
+   display: grid;[m
+   gap: 4px;[m
+[36m@@ -1751,8 +1931,42 @@[m [ma {[m
+   }[m
+ [m
+   .review-content {[m
+[31m-    grid-template-columns: minmax(0, 1fr) minmax(230px, 34%);[m
+[32m+[m[32m    grid-template-columns: minmax(0, 1fr);[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  .document-preview-card { position: static; }[m
+[32m+[m
+[32m+[m[32m  .document-preview {[m
+[32m+[m[32m    min-height: 240px;[m
+[32m+[m[32m    max-height: 360px;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  .document-preview iframe {[m
+[32m+[m[32m    height: 360px;[m
+[32m+[m[32m    min-height: 360px;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  .document-preview img { max-height: 360px; }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@media (min-width: 851px) and (max-width: 1000px) {[m
+[32m+[m[32m  .review-content {[m
+[32m+[m[32m    grid-template-columns: minmax(0, 1fr);[m
+   }[m
+[32m+[m
+[32m+[m[32m  .document-preview-card { position: static; }[m
+[32m+[m
+[32m+[m[32m  .document-preview {[m
+[32m+[m[32m    min-height: 240px;[m
+[32m+[m[32m    max-height: 360px;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  .document-preview iframe {[m
+[32m+[m[32m    height: 360px;[m
+[32m+[m[32m    min-height: 360px;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  .document-preview img { max-height: 360px; }[m
+ }[m
+ [m
+ @media (max-width: 680px) {[m
+[36m@@ -1998,3 +2212,343 @@[m [ma {[m
+   }[m
+ [m
+ }[m
+[32m+[m
+[32m+[m[32m:root {[m
+[32m+[m[32m  --ink: #1d2925;[m
+[32m+[m[32m  --muted: #78827b;[m
+[32m+[m[32m  --line: #dfe5dc;[m
+[32m+[m[32m  --paper: #f5f7f2;[m
+[32m+[m[32m  --panel: #fbfcf8;[m
+[32m+[m[32m  --forest: #18342d;[m
+[32m+[m[32m  --forest-soft: #24463c;[m
+[32m+[m[32m  --citrus: #d9ef55;[m
+[32m+[m[32m  --leaf: #5b7d3e;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.app-shell {[m
+[32m+[m[32m  background: var(--paper);[m
+[32m+[m[32m  color: var(--ink);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.sidebar {[m
+[32m+[m[32m  border-color: #29473d;[m
+[32m+[m[32m  background: var(--forest);[m
+[32m+[m[32m  padding-top: 27px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.brand-mark {[m
+[32m+[m[32m  border-radius: 9px;[m
+[32m+[m[32m  background: var(--citrus);[m
+[32m+[m[32m  color: var(--forest);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.brand strong { color: #f5f7ef; }[m
+[32m+[m[32m.brand small { color: #a7b9ae; }[m
+[32m+[m
+[32m+[m[32m.workspace-label {[m
+[32m+[m[32m  color: #96aa9e;[m
+[32m+[m[32m  letter-spacing: 0.08em;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.nav-item {[m
+[32m+[m[32m  border-radius: 6px;[m
+[32m+[m[32m  color: #c1cdc5;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.nav-item:hover {[m
+[32m+[m[32m  background: rgb(255 255 255 / 8%);[m
+[32m+[m[32m  color: #fff;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.nav-item.nav-active {[m
+[32m+[m[32m  background: rgb(217 239 85 / 13%);[m
+[32m+[m[32m  color: var(--citrus);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.nav-count,[m
+[32m+[m[32m.nav-active .nav-count {[m
+[32m+[m[32m  background: rgb(255 255 255 / 10%);[m
+[32m+[m[32m  color: #e7efdf;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.sidebar-promo {[m
+[32m+[m[32m  border-color: #365447;[m
+[32m+[m[32m  border-radius: 6px;[m
+[32m+[m[32m  background: #203d34;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.promo-icon {[m
+[32m+[m[32m  border-radius: 6px;[m
+[32m+[m[32m  background: rgb(217 239 85 / 13%);[m
+[32m+[m[32m  color: var(--citrus);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.sidebar-promo strong { color: #edf3eb; }[m
+[32m+[m[32m.sidebar-promo p { color: #b2c1b6; }[m
+[32m+[m
+[32m+[m[32m.sidebar-status {[m
+[32m+[m[32m  border-color: #365447;[m
+[32m+[m[32m  color: #b2c1b6;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.health-retry { color: #b2c1b6; }[m
+[32m+[m[32m.health-retry:hover { background: rgb(255 255 255 / 9%); color: #fff; }[m
+[32m+[m[32m.sidebar-status a { color: #b2c1b6; }[m
+[32m+[m
+[32m+[m[32m.app-main { background: var(--paper); }[m
+[32m+[m
+[32m+[m[32m.topbar {[m
+[32m+[m[32m  border-color: var(--line);[m
+[32m+[m[32m  background: rgb(251 252 248 / 94%);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.breadcrumb { color: #8a948c; }[m
+[32m+[m[32m.breadcrumb strong { color: var(--ink); }[m
+[32m+[m
+[32m+[m[32m.page-content { padding-top: 43px; }[m
+[32m+[m
+[32m+[m[32m.eyebrow {[m
+[32m+[m[32m  color: var(--leaf);[m
+[32m+[m[32m  letter-spacing: 0.1em;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.page-heading {[m
+[32m+[m[32m  align-items: flex-end;[m
+[32m+[m[32m  margin-bottom: 28px;[m
+[32m+[m[32m  border-bottom: 1px solid #ccd5c9;[m
+[32m+[m[32m  padding-bottom: 23px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.page-heading h1 {[m
+[32m+[m[32m  margin-top: 9px;[m
+[32m+[m[32m  color: var(--forest);[m
+[32m+[m[32m  font-family: Georgia, "Times New Roman", serif;[m
+[32m+[m[32m  font-size: 38px;[m
+[32m+[m[32m  font-weight: 500;[m
+[32m+[m[32m  letter-spacing: 0;[m
+[32m+[m[32m  line-height: 1.08;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.page-heading p { color: #6f7a72; }[m
+[32m+[m
+[32m+[m[32m.button-primary {[m
+[32m+[m[32m  border-color: var(--citrus);[m
+[32m+[m[32m  background: var(--citrus);[m
+[32m+[m[32m  color: #1c3025;[m
+[32m+[m[32m  box-shadow: none;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.button-primary:hover:not(:disabled) {[m
+[32m+[m[32m  border-color: #c8df3d;[m
+[32m+[m[32m  background: #c8df3d;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.button-quiet {[m
+[32m+[m[32m  border-color: #d8dfd5;[m
+[32m+[m[32m  background: var(--panel);[m
+[32m+[m[32m  color: #46564b;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.button-quiet:hover:not(:disabled) {[m
+[32m+[m[32m  border-color: #bac8b8;[m
+[32m+[m[32m  background: #f2f5ee;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.icon-button { color: #66746a; }[m
+[32m+[m[32m.icon-button:hover:not(:disabled) { border-color: #dce3d9; background: #eff3eb; color: var(--forest); }[m
+[32m+[m
+[32m+[m[32m.metrics-grid {[m
+[32m+[m[32m  gap: 0;[m
+[32m+[m[32m  margin-bottom: 28px;[m
+[32m+[m[32m  border-top: 1px solid #cbd5ca;[m
+[32m+[m[32m  border-bottom: 1px solid #cbd5ca;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metric-card,[m
+[32m+[m[32m.surface-card {[m
+[32m+[m[32m  border: 0;[m
+[32m+[m[32m  border-radius: 0;[m
+[32m+[m[32m  background: transparent;[m
+[32m+[m[32m  box-shadow: none;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metric-card {[m
+[32m+[m[32m  min-height: 132px;[m
+[32m+[m[32m  padding: 18px 17px 16px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metric-card + .metric-card { border-left: 1px solid #d5ddd2; }[m
+[32m+[m
+[32m+[m[32m.metric-heading {[m
+[32m+[m[32m  color: #66736a;[m
+[32m+[m[32m  font-size: 10px;[m
+[32m+[m[32m  font-weight: 600;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metric-icon {[m
+[32m+[m[32m  width: 28px;[m
+[32m+[m[32m  height: 28px;[m
+[32m+[m[32m  border-radius: 6px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metric-blue { background: #e6eee0; color: #45683b; }[m
+[32m+[m[32m.metric-green { background: #e6eee0; color: #45683b; }[m
+[32m+[m[32m.metric-amber { background: #f4edcf; color: #8b6a23; }[m
+[32m+[m[32m.metric-red { background: #f6e5de; color: #a34a37; }[m
+[32m+[m
+[32m+[m[32m.metric-value {[m
+[32m+[m[32m  margin-top: 13px;[m
+[32m+[m[32m  color: var(--forest);[m
+[32m+[m[32m  font-family: Georgia, "Times New Roman", serif;[m
+[32m+[m[32m  font-size: 31px;[m
+[32m+[m[32m  font-weight: 500;[m
+[32m+[m[32m  letter-spacing: 0;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metric-note { color: #89938b; font-size: 9px; }[m
+[32m+[m
+[32m+[m[32m.dashboard-grid {[m
+[32m+[m[32m  grid-template-columns: minmax(0, 1.75fr) minmax(260px, 0.9fr);[m
+[32m+[m[32m  gap: 30px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.surface-card {[m
+[32m+[m[32m  border-top: 2px solid var(--forest);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.card-heading {[m
+[32m+[m[32m  min-height: 75px;[m
+[32m+[m[32m  padding-right: 15px;[m
+[32m+[m[32m  padding-left: 15px;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.card-heading h2 {[m
+[32m+[m[32m  color: var(--forest);[m
+[32m+[m[32m  font-size: 14px;[m
+[32m+[m[32m  font-weight: 650;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.card-heading p { color: #818c83; }[m
+[32m+[m[32m.text-button { color: #48683c; }[m
+[32m+[m[32m.text-button:hover { color: #274c31; }[m
+[32m+[m
+[32m+[m[32m.insights-icon {[m
+[32m+[m[32m  border-radius: 6px;[m
+[32m+[m[32m  background: #e8eee1;[m
+[32m+[m[32m  color: #4b6a3d;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.distribution-total strong,[m
+[32m+[m[32m.distribution-total span { color: var(--forest); }[m
+[32m+[m[32m.distribution-total strong { font-family: Georgia, "Times New Roman", serif; font-weight: 500; }[m
+[32m+[m[32m.distribution-bars { gap: 12px; }[m
+[32m+[m[32m.distribution-label { color: #66736a; }[m
+[32m+[m[32m.distribution-track { background: #e8ece4; }[m
+[32m+[m[32m.bar-green { background: #638843; }[m
+[32m+[m[32m.bar-red { background: #c86650; }[m
+[32m+[m[32m.bar-amber { background: #c5a13c; }[m
+[32m+[m[32m.bar-slate { background: #a2aaa0; }[m
+[32m+[m[32m.totals-heading { border-color: #dfe5dc; color: #56665a; }[m
+[32m+[m[32m.currency-totals strong { color: var(--forest); }[m
+[32m+[m
+[32m+[m[32m.invoice-table th {[m
+[32m+[m[32m  border-color: #e0e6dd;[m
+[32m+[m[32m  background: #eef2e9;[m
+[32m+[m[32m  color: #778379;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.invoice-table td {[m
+[32m+[m[32m  border-color: #e7ebe4;[m
+[32m+[m[32m  color: #647168;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.invoice-table tbody tr:hover { background: #f0f4e9; }[m
+[32m+[m[32m.table-primary { color: var(--forest); }[m
+[32m+[m[32m.table-secondary { color: #89948b; }[m
+[32m+[m[32m.amount-cell { color: var(--forest) !important; }[m
+[32m+[m
+[32m+[m[32m.status-passed,[m
+[32m+[m[32m.status-completed { border-color: #d1dfc7; background: #edf4e8; color: #4b713a; }[m
+[32m+[m[32m.status-failed { border-color: #ebd0c8; background: #fbefeb; color: #a84c3c; }[m
+[32m+[m[32m.status-warning,[m
+[32m+[m[32m.status-processing { border-color: #e8dfb9; background: #f8f4df; color: #83671f; }[m
+[32m+[m[32m.status-not-checked,[m
+[32m+[m[32m.status-pending { border-color: #dfe4dc; background: #f0f2ed; color: #6f7b71; }[m
+[32m+[m
+[32m+[m[32m.empty-icon { border-radius: 8px; background: #e9eee5; color: #647a58; }[m
+[32m+[m[32m.app-footer { border-color: var(--line); color: #8a948c; }[m
+[32m+[m[32m.app-footer a { color: #5e725f; }[m
+[32m+[m[32m.notice-banner { border-color: #d1dfc7; border-radius: 6px; background: #edf4e8; color: #4b713a; }[m
+[32m+[m
+[32m+[m[32m.history-card { border-top-width: 2px; }[m
+[32m+[m[32m.history-toolbar { border-color: #e0e6dd; }[m
+[32m+[m[32m.search-field,[m
+[32m+[m[32m.filter-field,[m
+[32m+[m[32m.sort-field {[m
+[32m+[m[32m  border-color: #dce3d9;[m
+[32m+[m[32m  border-radius: 5px;[m
+[32m+[m[32m  background: var(--panel);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.search-field input,[m
+[32m+[m[32m.filter-field select,[m
+[32m+[m[32m.sort-field select { color: #45554a; }[m
+[32m+[m[32m.search-field:focus-within { border-color: #80966b; box-shadow: 0 0 0 3px rgb(91 125 62 / 10%); }[m
+[32m+[m[32m.pagination { border-color: #e0e6dd; }[m
+[32m+[m
+[32m+[m[32m.dropzone {[m
+[32m+[m[32m  border-color: #c9d4c5;[m
+[32m+[m[32m  border-radius: 10px;[m
+[32m+[m[32m  background: radial-gradient(circle at 50% 32%, rgb(91 125 62 / 8%), transparent 48%), #fbfcf8;[m
+[32m+[m[32m}[m
+[32m+[m[32m.dropzone:hover,[m
+[32m+[m[32m.dropzone-active,[m
+[32m+[m[32m.dropzone-selected {[m
+[32m+[m[32m  border-color: #819a68;[m
+[32m+[m[32m  background: radial-gradient(circle at 50% 32%, rgb(91 125 62 / 12%), transparent 48%), #f4f7ef;[m
+[32m+[m[32m}[m
+[32m+[m[32m.dropzone-icon { border-color: #dce5d5; border-radius: 13px; color: #55743e; }[m
+[32m+[m[32m.text-link { color: #4e713b; }[m
+[32m+[m[32m.review-file-icon { border-radius: 7px; background: #e8eee1; color: #55743e; }[m
+[32m+[m[32m.form-field input:focus { border-color: #819a68; box-shadow: 0 0 0 3px rgb(91 125 62 / 10%); }[m
+[32m+[m[32m.review-panel { background: var(--paper); }[m
+[32m+[m
+[32m+[m[32m.page-heading,[m
+[32m+[m[32m.metrics-grid,[m
+[32m+[m[32m.dashboard-grid,[m
+[32m+[m[32m.history-card {[m
+[32m+[m[32m  animation: rise-in 420ms ease-out both;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m.metrics-grid { animation-delay: 50ms; }[m
+[32m+[m[32m.dashboard-grid,[m
+[32m+[m[32m.history-card { animation-delay: 100ms; }[m
+[32m+[m
+[32m+[m[32m@keyframes rise-in {[m
+[32m+[m[32m  from { opacity: 0; transform: translateY(8px); }[m
+[32m+[m[32m  to { opacity: 1; transform: translateY(0); }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@media (max-width: 1150px) {[m
+[32m+[m[32m  .metric-card { padding-right: 14px; padding-left: 14px; }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@media (max-width: 850px) {[m
+[32m+[m[32m  .sidebar { border-bottom-color: #29473d; }[m
+[32m+[m[32m  .page-content { padding-top: 32px; }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m@media (max-width: 680px) {[m
+[32m+[m[32m  .page-heading { padding-bottom: 18px; }[m
+[32m+[m[32m  .page-heading h1 { font-size: 31px; }[m
+[32m+[m[32m  .metrics-grid { border-bottom: 0; }[m
+[32m+[m[32m  .metric-card { min-height: 112px; padding: 13px 10px; }[m
+[32m+[m[32m  .metric-card + .metric-card { border-left: 0; }[m
+[32m+[m[32m  .metric-card:nth-child(even) { border-left: 1px solid #d5ddd2; }[m
+[32m+[m[32m  .metric-card:nth-child(n + 3) { border-top: 1px solid #d5ddd2; }[m
+[32m+[m[32m  .metric-value { font-size: 28px; }[m
+[32m+[m[32m  .dashboard-grid { grid-template-columns: 1fr; gap: 22px; }[m
+[32m+[m[32m  .recent-card,[m
+[32m+[m[32m  .insights-card { border-top-width: 2px; }[m
+[32m+[m[32m  .app-footer { background: var(--paper); }[m
+[32m+[m[32m}[m
+[1mdiff --git a/frontend/src/App.tsx b/frontend/src/App.tsx[m
+[1mindex bc825d7..0ad0980 100644[m
+[1m--- a/frontend/src/App.tsx[m
+[1m+++ b/frontend/src/App.tsx[m
+[36m@@ -36,7 +36,7 @@[m [mimport {[m
+   getInvoiceExportUrl,[m
+   getInvoices,[m
+   updateInvoice,[m
+[31m-  uploadInvoice,[m
+[32m+[m[32m  uploadInvoices,[m
+   validateInvoice,[m
+   type DashboardStats,[m
+   type FieldEvidence,[m
+[36m@@ -216,26 +216,35 @@[m [mfunction UploadDialog({[m
+   error,[m
+ }: {[m
+   onClose: () => void[m
+[31m-  onUpload: (file: File) => void[m
+[32m+[m[32m  onUpload: (files: File[]) => void[m
+   isUploading: boolean[m
+   error: string | null[m
+ }) {[m
+[31m-  const [file, setFile] = useState<File | null>(null)[m
+[32m+[m[32m  const [files, setFiles] = useState<File[]>([])[m
+   const [dragging, setDragging] = useState(false)[m
+[32m+[m[32m  const [selectionError, setSelectionError] = useState<string | null>(null)[m
+ [m
+   function chooseFile(event: ChangeEvent<HTMLInputElement>) {[m
+[31m-    setFile(event.target.files?.[0] ?? null)[m
+[32m+[m[32m    addFiles(Array.from(event.target.files ?? []))[m
+[32m+[m[32m    event.currentTarget.value = ''[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  function addFiles(incoming: File[]) {[m
+[32m+[m[32m    setSelectionError(null)[m
+[32m+[m[32m    const combined = [...files, ...incoming][m
+[32m+[m[32m    if (combined.length > 10) setSelectionError('Choose no more than 10 invoices at a time.')[m
+[32m+[m[32m    setFiles(combined.slice(0, 10))[m
+   }[m
+ [m
+   function dropFile(event: DragEvent<HTMLLabelElement>) {[m
+     event.preventDefault()[m
+     setDragging(false)[m
+[31m-    setFile(event.dataTransfer.files[0] ?? null)[m
+[32m+[m[32m    addFiles(Array.from(event.dataTransfer.files))[m
+   }[m
+ [m
+   function submit(event: FormEvent<HTMLFormElement>) {[m
+     event.preventDefault()[m
+[31m-    if (file) onUpload(file)[m
+[32m+[m[32m    if (files.length > 0) onUpload(files)[m
+   }[m
+ [m
+   return ([m
+[36m@@ -243,38 +252,50 @@[m [mfunction UploadDialog({[m
+       <section className="upload-dialog" role="dialog" aria-modal="true" aria-labelledby="upload-title">[m
+         <div className="dialog-heading">[m
+           <div>[m
+[31m-            <span className="eyebrow">DOCUMENT INTAKE</span>[m
+[31m-            <h2 id="upload-title">Upload an invoice</h2>[m
+[31m-            <p>We’ll extract the details and check the totals for you.</p>[m
+[32m+[m[32m            <span className="eyebrow">BATCH DOCUMENT INTAKE</span>[m
+[32m+[m[32m            <h2 id="upload-title">Upload invoices</h2>[m
+[32m+[m[32m            <p>Each document is processed independently in the background.</p>[m
+           </div>[m
+           <button className="icon-button" type="button" onClick={onClose} disabled={isUploading} aria-label="Close upload dialog"><X size={19} /></button>[m
+         </div>[m
+         <form onSubmit={submit}>[m
+           <label[m
+[31m-            className={`dropzone ${dragging ? 'dropzone-active' : ''} ${file ? 'dropzone-selected' : ''}`}[m
+[32m+[m[32m            className={`dropzone ${dragging ? 'dropzone-active' : ''} ${files.length > 0 ? 'dropzone-selected' : ''}`}[m
+             onDragOver={(event) => { event.preventDefault(); setDragging(true) }}[m
+             onDragLeave={() => setDragging(false)}[m
+             onDrop={dropFile}[m
+           >[m
+[31m-            <input type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={chooseFile} />[m
+[31m-            <span className="dropzone-icon"><CloudUpload size={24} /></span>[m
+[31m-            {file ? ([m
+[31m-              <>[m
+[31m-                <strong>{file.name}</strong>[m
+[31m-                <span>{(file.size / (1024 * 1024)).toFixed(2)} MB · Ready to process</span>[m
+[31m-              </>[m
+[31m-            ) : ([m
+[31m-              <>[m
+[31m-                <strong>Drop your invoice here, or <span className="text-link">browse files</span></strong>[m
+[31m-                <span>PDF, PNG or JPG · up to 15 MB</span>[m
+[31m-              </>[m
+[31m-            )}[m
+[32m+[m[32m            <input type="file" multiple disabled={isUploading} accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={chooseFile} />[m
+[32m+[m[32m            <span className={`dropzone-icon ${files.length > 0 ? 'dropzone-icon-ready' : ''}`}>[m
+[32m+[m[32m              {files.length > 0 ? <FileCheck2 size={23} /> : <CloudUpload size={24} />}[m
+[32m+[m[32m            </span>[m
+[32m+[m[32m            <span className="dropzone-copy">[m
+[32m+[m[32m              <strong>{files.length > 0 ? `${files.length} ${files.length === 1 ? 'invoice' : 'invoices'} selected` : 'Drop invoices here'}</strong>[m
+[32m+[m[32m              <span>PDF, PNG or JPG · up to 10 files · 15 MB each</span>[m
+[32m+[m[32m            </span>[m
+[32m+[m[32m            <span className="dropzone-browse">Browse files</span>[m
+           </label>[m
+[31m-          {error && <div className="inline-error"><CircleAlert size={16} />{error}</div>}[m
+[32m+[m[32m          {files.length > 0 && ([m
+[32m+[m[32m            <div className="upload-file-list" aria-live="polite">[m
+[32m+[m[32m              <div className="upload-file-list-heading">[m
+[32m+[m[32m                <strong>Selected files</strong>[m
+[32m+[m[32m                <button type="button" className="text-button" onClick={() => setFiles([])} disabled={isUploading}>Clear all</button>[m
+[32m+[m[32m              </div>[m
+[32m+[m[32m              {files.map((file, index) => ([m
+[32m+[m[32m                <div className="upload-file-row" key={`${file.name}-${file.size}-${file.lastModified}-${index}`}>[m
+[32m+[m[32m                  <FileText size={15} />[m
+[32m+[m[32m                  <span>{file.name}</span>[m
+[32m+[m[32m                  <small>{(file.size / (1024 * 1024)).toFixed(2)} MB</small>[m
+[32m+[m[32m                  <button type="button" className="icon-button" onClick={() => setFiles((current) => current.filter((_, fileIndex) => fileIndex !== index))} disabled={isUploading} aria-label={`Remove ${file.name}`}><X size={14} /></button>[m
+[32m+[m[32m                </div>[m
+[32m+[m[32m              ))}[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m          )}[m
+[32m+[m[32m          {(selectionError || error) && <div className="inline-error" role="alert"><CircleAlert size={16} />{selectionError || error}</div>}[m
+           <div className="dialog-actions">[m
+             <button className="button button-quiet" type="button" onClick={onClose} disabled={isUploading}>Cancel</button>[m
+[31m-            <button className="button button-primary" type="submit" disabled={!file || isUploading}>[m
+[31m-              {isUploading ? <><LoaderCircle className="spin" size={16} /> Processing…</> : <><CloudUpload size={16} /> Upload invoice</>}[m
+[32m+[m[32m            <button className="button button-primary" type="submit" disabled={files.length === 0 || isUploading}>[m
+[32m+[m[32m              {isUploading ? <><LoaderCircle className="spin" size={16} /> Queuing…</> : <><CloudUpload size={16} /> Upload {files.length > 0 ? `${files.length} ${files.length === 1 ? 'invoice' : 'invoices'}` : 'invoices'}</>}[m
+             </button>[m
+           </div>[m
+         </form>[m
+[36m@@ -380,6 +401,21 @@[m [mfunction InvoiceReview({[m
+   const previewIsImage = /\.(png|jpe?g)$/i.test(invoice.original_filename)[m
+   const checks = invoice.validation_results ?? [][m
+   const ocrLines = invoice.extraction_metadata?.ocr_lines ?? [][m
+[32m+[m[32m  const hiddenWarningPatterns = [[m
+[32m+[m[32m    /Local rule-based extraction is conservative/i,[m
+[32m+[m[32m    /OCR punctuation in the date .* was corrected/i,[m
+[32m+[m[32m    /Supplier name was inferred from the document header/i,[m
+[32m+[m[32m    /Supplier address was inferred from the document header/i,[m
+[32m+[m[32m    /No separate discount or additional-charge summary was identified/i,[m
+[32m+[m[32m  ][m
+[32m+[m[32m  const warnings = Array.from([m
+[32m+[m[32m    new Map([m
+[32m+[m[32m      (invoice.extraction_metadata?.warnings ?? [])[m
+[32m+[m[32m        .filter((warning) => !hiddenWarningPatterns.some((pattern) => pattern.test(warning)))[m
+[32m+[m[32m        .map((warning) => [warning, warning]),[m
+[32m+[m[32m    ).values(),[m
+[32m+[m[32m  )[m
+[32m+[m[32m  const rawJson = invoice.raw_extraction_json[m
+ [m
+   return ([m
+     <div className="review-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>[m
+[36m@@ -405,7 +441,7 @@[m [mfunction InvoiceReview({[m
+             {invoice.processing_error && ([m
+               <div className="processing-notice"><ShieldAlert size={18} /><div><strong>Extraction needs attention</strong><span>{invoice.processing_error}</span></div></div>[m
+             )}[m
+[31m-            {invoice.extraction_metadata?.warnings?.map((warning) => ([m
+[32m+[m[32m            {warnings.map((warning) => ([m
+               <div className="processing-notice warning-notice" key={warning}><CircleAlert size={18} /><div><strong>Processing note</strong><span>{warning}</span></div></div>[m
+             ))}[m
+ [m
+[36m@@ -498,6 +534,13 @@[m [mfunction InvoiceReview({[m
+               </details>[m
+             )}[m
+ [m
+[32m+[m[32m            {rawJson && ([m
+[32m+[m[32m              <details className="review-card evidence-card json-card">[m
+[32m+[m[32m                <summary><span><FileText size={17} /> Raw JSON</span><span>Extraction payload</span></summary>[m
+[32m+[m[32m                <pre className="json-output">{JSON.stringify(rawJson, null, 2)}</pre>[m
+[32m+[m[32m              </details>[m
+[32m+[m[32m            )}[m
+[32m+[m
+             <div className="review-danger-zone">[m
+               <div><strong>Delete this invoice</strong><span>Remove the invoice record and its stored document.</span></div>[m
+               <button className="button button-danger button-small" type="button" onClick={onDelete} disabled={deleting}>[m
+[36m@@ -576,7 +619,7 @@[m [mfunction Dashboard({[m
+   return ([m
+     <>[m
+       <div className="page-heading">[m
+[31m-        <div><span className="eyebrow">WORKSPACE OVERVIEW</span><h1>Good to see you.</h1><p>Here’s what’s happening with your invoices.</p></div>[m
+[32m+[m[32m        <div><span className="eyebrow">WORKSPACE OVERVIEW</span><h1>Your invoice desk.</h1><p>Every document, extraction, and check in one place.</p></div>[m
+         <button className="button button-primary" type="button" onClick={onUpload}><Plus size={17} /> Upload invoice</button>[m
+       </div>[m
+       <div className="metrics-grid">[m
+[36m@@ -685,27 +728,39 @@[m [mfunction App() {[m
+     queryFn: () => getInvoices(params),[m
+     enabled: section === 'invoices',[m
+     placeholderData: (previous) => previous,[m
+[32m+[m[32m    refetchInterval: (query) => query.state.data?.items.some([m
+[32m+[m[32m      (invoice) => invoice.processing_status === 'PENDING' || invoice.processing_status === 'PROCESSING',[m
+[32m+[m[32m    ) ? 1500 : false,[m
+   })[m
+   const selectedQuery = useQuery({[m
+     queryKey: ['invoice', selectedId],[m
+     queryFn: () => getInvoice(selectedId!),[m
+     enabled: selectedId !== null,[m
+[32m+[m[32m    refetchInterval: (query) => {[m
+[32m+[m[32m      const status = query.state.data?.processing_status[m
+[32m+[m[32m      return status === 'PROCESSING' ? 2000 : false[m
+[32m+[m[32m    },[m
+   })[m
+ [m
+   const uploadMutation = useMutation({[m
+[31m-    mutationFn: uploadInvoice,[m
+[31m-    onSuccess: async (invoice) => {[m
+[32m+[m[32m    mutationFn: (files: File[]) => uploadInvoices(files),[m
+[32m+[m[32m    onSuccess: async (invoices) => {[m
+       await Promise.all([[m
+         queryClient.invalidateQueries({ queryKey: ['dashboard'] }),[m
+         queryClient.invalidateQueries({ queryKey: ['invoices'] }),[m
+       ])[m
+[31m-      queryClient.setQueryData(['invoice', invoice.id], invoice)[m
+[32m+[m[32m      for (const invoice of invoices) {[m
+[32m+[m[32m        queryClient.setQueryData(['invoice', invoice.id], invoice)[m
+[32m+[m[32m      }[m
+       setUploadOpen(false)[m
+       setSection('invoices')[m
+[31m-      setSelectedId(invoice.id)[m
+[31m-      setNotice(invoice.processing_status === 'FAILED'[m
+[31m-        ? 'Invoice saved, but extraction needs attention. Review the document and enter details manually.'[m
+[31m-        : 'Invoice uploaded and processed successfully.')[m
+[32m+[m[32m      if (invoices.length === 1) {[m
+[32m+[m[32m        setSelectedId(invoices[0].id)[m
+[32m+[m[32m        setNotice('Invoice uploaded and queued for processing. We’ll refresh it as extraction finishes.')[m
+[32m+[m[32m      } else {[m
+[32m+[m[32m        setSelectedId(null)[m
+[32m+[m[32m        setNotice(`${invoices.length} invoices uploaded. Processing continues in the background; statuses refresh automatically.`)[m
+[32m+[m[32m      }[m
+     },[m
+   })[m
+   const saveMutation = useMutation({[m
+[36m@@ -770,7 +825,7 @@[m [mfunction App() {[m
+     <div className="app-shell">[m
+       <aside className="sidebar">[m
+         <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setSection('overview') }}>[m
+[31m-          <span className="brand-mark">IQ</span>[m
+[32m+[m[32m          <span className="brand-mark" aria-hidden="true"><FileCheck2 size={21} strokeWidth={2.2} /></span>[m
+           <span><strong>InvoiceIQ</strong><small>Invoice workspace</small></span>[m
+         </a>[m
+         <div className="workspace-label">WORKSPACE</div>[m
+[36m@@ -807,7 +862,7 @@[m [mfunction App() {[m
+         <footer className="app-footer"><span>InvoiceIQ · Invoice processing with evidence</span><a href="http://localhost:8000/docs" target="_blank" rel="noreferrer">API documentation <ArrowUpRight size={13} /></a></footer>[m
+       </div>[m
+ [m
+[31m-      {uploadOpen && <UploadDialog onClose={() => { if (!uploadMutation.isPending) setUploadOpen(false) }} onUpload={(file) => uploadMutation.mutate(file)} isUploading={uploadMutation.isPending} error={uploadMutation.error?.message ?? null} />}[m
+[32m+[m[32m      {uploadOpen && <UploadDialog onClose={() => { if (!uploadMutation.isPending) setUploadOpen(false) }} onUpload={(files) => uploadMutation.mutate(files)} isUploading={uploadMutation.isPending} error={uploadMutation.error?.message ?? null} />}[m
+       {selectedId !== null && ([m
+         selectedQuery.isLoading ? <div className="review-backdrop"><div className="review-loading"><LoaderCircle className="spin" size={24} /> Loading invoice…</div></div>[m
+           : selectedQuery.error ? <div className="review-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeReview() }}><div className="review-error"><button className="icon-button" type="button" onClick={closeReview} aria-label="Close"><X size={18} /></button><CircleAlert size={22} /><strong>Couldn’t open this invoice</strong><span>{selectedQuery.error.message}</span><button className="button button-quiet" type="button" onClick={() => void selectedQuery.refetch()}>Try again</button></div></div>[m
+[1mdiff --git a/frontend/src/index.css b/frontend/src/index.css[m
+[1mindex a370071..ef4d30a 100644[m
+[1m--- a/frontend/src/index.css[m
+[1m+++ b/frontend/src/index.css[m
+[36m@@ -5,14 +5,14 @@[m
+ @custom-variant dark (&:is(.dark *));[m
+ [m
+ :root {[m
+[31m-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;[m
+[32m+[m[32m  font-family: "Geist Variable", "Segoe UI", sans-serif;[m
+   font-synthesis: none;[m
+   text-rendering: optimizeLegibility;[m
+   -webkit-font-smoothing: antialiased;[m
+   -moz-osx-font-smoothing: grayscale;[m
+ [m
+[31m-  color: #0f172a;[m
+[31m-  background: #f8fafc;[m
+[32m+[m[32m  color: #1d2925;[m
+[32m+[m[32m  background: #f5f7f2;[m
+   --background: oklch(1 0 0);[m
+   --foreground: oklch(0.145 0 0);[m
+   --card: oklch(1 0 0);[m
+[1mdiff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts[m
+[1mindex 1830ebe..f447fbf 100644[m
+[1m--- a/frontend/src/lib/api.ts[m
+[1m+++ b/frontend/src/lib/api.ts[m
+[36m@@ -221,6 +221,12 @@[m [mexport function uploadInvoice(file: File): Promise<Invoice> {[m
+   return request('/api/invoices/upload', { method: 'POST', body: form })[m
+ }[m
+ [m
+[32m+[m[32mexport function uploadInvoices(files: File[]): Promise<Invoice[]> {[m
+[32m+[m[32m  const form = new FormData()[m
+[32m+[m[32m  for (const file of files) form.append('files', file)[m
+[32m+[m[32m  return request('/api/invoices/bulk-upload', { method: 'POST', body: form })[m
+[32m+[m[32m}[m
+[32m+[m
+ export function updateInvoice(id: number, correction: InvoiceCorrection): Promise<Invoice> {[m
+   return request(`/api/invoices/${id}`, {[m
+     method: 'PATCH',[m

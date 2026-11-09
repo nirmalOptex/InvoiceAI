@@ -36,7 +36,7 @@ import {
   getInvoiceExportUrl,
   getInvoices,
   updateInvoice,
-  uploadInvoice,
+  uploadInvoices,
   validateInvoice,
   type DashboardStats,
   type FieldEvidence,
@@ -216,26 +216,35 @@ function UploadDialog({
   error,
 }: {
   onClose: () => void
-  onUpload: (file: File) => void
+  onUpload: (files: File[]) => void
   isUploading: boolean
   error: string | null
 }) {
-  const [file, setFile] = useState<File | null>(null)
+  const [files, setFiles] = useState<File[]>([])
   const [dragging, setDragging] = useState(false)
+  const [selectionError, setSelectionError] = useState<string | null>(null)
 
   function chooseFile(event: ChangeEvent<HTMLInputElement>) {
-    setFile(event.target.files?.[0] ?? null)
+    addFiles(Array.from(event.target.files ?? []))
+    event.currentTarget.value = ''
+  }
+
+  function addFiles(incoming: File[]) {
+    setSelectionError(null)
+    const combined = [...files, ...incoming]
+    if (combined.length > 10) setSelectionError('Choose no more than 10 invoices at a time.')
+    setFiles(combined.slice(0, 10))
   }
 
   function dropFile(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault()
     setDragging(false)
-    setFile(event.dataTransfer.files[0] ?? null)
+    addFiles(Array.from(event.dataTransfer.files))
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (file) onUpload(file)
+    if (files.length > 0) onUpload(files)
   }
 
   return (
@@ -243,38 +252,50 @@ function UploadDialog({
       <section className="upload-dialog" role="dialog" aria-modal="true" aria-labelledby="upload-title">
         <div className="dialog-heading">
           <div>
-            <span className="eyebrow">DOCUMENT INTAKE</span>
-            <h2 id="upload-title">Upload an invoice</h2>
-            <p>We’ll extract the details and check the totals for you.</p>
+            <span className="eyebrow">BATCH DOCUMENT INTAKE</span>
+            <h2 id="upload-title">Upload invoices</h2>
+            <p>Each document is processed independently in the background.</p>
           </div>
           <button className="icon-button" type="button" onClick={onClose} disabled={isUploading} aria-label="Close upload dialog"><X size={19} /></button>
         </div>
         <form onSubmit={submit}>
           <label
-            className={`dropzone ${dragging ? 'dropzone-active' : ''} ${file ? 'dropzone-selected' : ''}`}
+            className={`dropzone ${dragging ? 'dropzone-active' : ''} ${files.length > 0 ? 'dropzone-selected' : ''}`}
             onDragOver={(event) => { event.preventDefault(); setDragging(true) }}
             onDragLeave={() => setDragging(false)}
             onDrop={dropFile}
           >
-            <input type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={chooseFile} />
-            <span className="dropzone-icon"><CloudUpload size={24} /></span>
-            {file ? (
-              <>
-                <strong>{file.name}</strong>
-                <span>{(file.size / (1024 * 1024)).toFixed(2)} MB · Ready to process</span>
-              </>
-            ) : (
-              <>
-                <strong>Drop your invoice here, or <span className="text-link">browse files</span></strong>
-                <span>PDF, PNG or JPG · up to 15 MB</span>
-              </>
-            )}
+            <input type="file" multiple disabled={isUploading} accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" onChange={chooseFile} />
+            <span className={`dropzone-icon ${files.length > 0 ? 'dropzone-icon-ready' : ''}`}>
+              {files.length > 0 ? <FileCheck2 size={23} /> : <CloudUpload size={24} />}
+            </span>
+            <span className="dropzone-copy">
+              <strong>{files.length > 0 ? `${files.length} ${files.length === 1 ? 'invoice' : 'invoices'} selected` : 'Drop invoices here'}</strong>
+              <span>PDF, PNG or JPG · up to 10 files · 15 MB each</span>
+            </span>
+            <span className="dropzone-browse">Browse files</span>
           </label>
-          {error && <div className="inline-error"><CircleAlert size={16} />{error}</div>}
+          {files.length > 0 && (
+            <div className="upload-file-list" aria-live="polite">
+              <div className="upload-file-list-heading">
+                <strong>Selected files</strong>
+                <button type="button" className="text-button" onClick={() => setFiles([])} disabled={isUploading}>Clear all</button>
+              </div>
+              {files.map((file, index) => (
+                <div className="upload-file-row" key={`${file.name}-${file.size}-${file.lastModified}-${index}`}>
+                  <FileText size={15} />
+                  <span>{file.name}</span>
+                  <small>{(file.size / (1024 * 1024)).toFixed(2)} MB</small>
+                  <button type="button" className="icon-button" onClick={() => setFiles((current) => current.filter((_, fileIndex) => fileIndex !== index))} disabled={isUploading} aria-label={`Remove ${file.name}`}><X size={14} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+          {(selectionError || error) && <div className="inline-error" role="alert"><CircleAlert size={16} />{selectionError || error}</div>}
           <div className="dialog-actions">
             <button className="button button-quiet" type="button" onClick={onClose} disabled={isUploading}>Cancel</button>
-            <button className="button button-primary" type="submit" disabled={!file || isUploading}>
-              {isUploading ? <><LoaderCircle className="spin" size={16} /> Processing…</> : <><CloudUpload size={16} /> Upload invoice</>}
+            <button className="button button-primary" type="submit" disabled={files.length === 0 || isUploading}>
+              {isUploading ? <><LoaderCircle className="spin" size={16} /> Queuing…</> : <><CloudUpload size={16} /> Upload {files.length > 0 ? `${files.length} ${files.length === 1 ? 'invoice' : 'invoices'}` : 'invoices'}</>}
             </button>
           </div>
         </form>
@@ -380,6 +401,21 @@ function InvoiceReview({
   const previewIsImage = /\.(png|jpe?g)$/i.test(invoice.original_filename)
   const checks = invoice.validation_results ?? []
   const ocrLines = invoice.extraction_metadata?.ocr_lines ?? []
+  const hiddenWarningPatterns = [
+    /Local rule-based extraction is conservative/i,
+    /OCR punctuation in the date .* was corrected/i,
+    /Supplier name was inferred from the document header/i,
+    /Supplier address was inferred from the document header/i,
+    /No separate discount or additional-charge summary was identified/i,
+  ]
+  const warnings = Array.from(
+    new Map(
+      (invoice.extraction_metadata?.warnings ?? [])
+        .filter((warning) => !hiddenWarningPatterns.some((pattern) => pattern.test(warning)))
+        .map((warning) => [warning, warning]),
+    ).values(),
+  )
+  const rawJson = invoice.raw_extraction_json
 
   return (
     <div className="review-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
@@ -405,7 +441,7 @@ function InvoiceReview({
             {invoice.processing_error && (
               <div className="processing-notice"><ShieldAlert size={18} /><div><strong>Extraction needs attention</strong><span>{invoice.processing_error}</span></div></div>
             )}
-            {invoice.extraction_metadata?.warnings?.map((warning) => (
+            {warnings.map((warning) => (
               <div className="processing-notice warning-notice" key={warning}><CircleAlert size={18} /><div><strong>Processing note</strong><span>{warning}</span></div></div>
             ))}
 
@@ -498,6 +534,13 @@ function InvoiceReview({
               </details>
             )}
 
+            {rawJson && (
+              <details className="review-card evidence-card json-card">
+                <summary><span><FileText size={17} /> Raw JSON</span><span>Extraction payload</span></summary>
+                <pre className="json-output">{JSON.stringify(rawJson, null, 2)}</pre>
+              </details>
+            )}
+
             <div className="review-danger-zone">
               <div><strong>Delete this invoice</strong><span>Remove the invoice record and its stored document.</span></div>
               <button className="button button-danger button-small" type="button" onClick={onDelete} disabled={deleting}>
@@ -576,7 +619,7 @@ function Dashboard({
   return (
     <>
       <div className="page-heading">
-        <div><span className="eyebrow">WORKSPACE OVERVIEW</span><h1>Good to see you.</h1><p>Here’s what’s happening with your invoices.</p></div>
+        <div><span className="eyebrow">WORKSPACE OVERVIEW</span><h1>Your invoice desk.</h1><p>Every document, extraction, and check in one place.</p></div>
         <button className="button button-primary" type="button" onClick={onUpload}><Plus size={17} /> Upload invoice</button>
       </div>
       <div className="metrics-grid">
@@ -685,27 +728,39 @@ function App() {
     queryFn: () => getInvoices(params),
     enabled: section === 'invoices',
     placeholderData: (previous) => previous,
+    refetchInterval: (query) => query.state.data?.items.some(
+      (invoice) => invoice.processing_status === 'PENDING' || invoice.processing_status === 'PROCESSING',
+    ) ? 1500 : false,
   })
   const selectedQuery = useQuery({
     queryKey: ['invoice', selectedId],
     queryFn: () => getInvoice(selectedId!),
     enabled: selectedId !== null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.processing_status
+      return status === 'PROCESSING' ? 2000 : false
+    },
   })
 
   const uploadMutation = useMutation({
-    mutationFn: uploadInvoice,
-    onSuccess: async (invoice) => {
+    mutationFn: (files: File[]) => uploadInvoices(files),
+    onSuccess: async (invoices) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['dashboard'] }),
         queryClient.invalidateQueries({ queryKey: ['invoices'] }),
       ])
-      queryClient.setQueryData(['invoice', invoice.id], invoice)
+      for (const invoice of invoices) {
+        queryClient.setQueryData(['invoice', invoice.id], invoice)
+      }
       setUploadOpen(false)
       setSection('invoices')
-      setSelectedId(invoice.id)
-      setNotice(invoice.processing_status === 'FAILED'
-        ? 'Invoice saved, but extraction needs attention. Review the document and enter details manually.'
-        : 'Invoice uploaded and processed successfully.')
+      if (invoices.length === 1) {
+        setSelectedId(invoices[0].id)
+        setNotice('Invoice uploaded and queued for processing. We’ll refresh it as extraction finishes.')
+      } else {
+        setSelectedId(null)
+        setNotice(`${invoices.length} invoices uploaded. Processing continues in the background; statuses refresh automatically.`)
+      }
     },
   })
   const saveMutation = useMutation({
@@ -770,7 +825,7 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setSection('overview') }}>
-          <span className="brand-mark">IQ</span>
+          <span className="brand-mark" aria-hidden="true"><FileCheck2 size={21} strokeWidth={2.2} /></span>
           <span><strong>InvoiceIQ</strong><small>Invoice workspace</small></span>
         </a>
         <div className="workspace-label">WORKSPACE</div>
@@ -807,7 +862,7 @@ function App() {
         <footer className="app-footer"><span>InvoiceIQ · Invoice processing with evidence</span><a href="http://localhost:8000/docs" target="_blank" rel="noreferrer">API documentation <ArrowUpRight size={13} /></a></footer>
       </div>
 
-      {uploadOpen && <UploadDialog onClose={() => { if (!uploadMutation.isPending) setUploadOpen(false) }} onUpload={(file) => uploadMutation.mutate(file)} isUploading={uploadMutation.isPending} error={uploadMutation.error?.message ?? null} />}
+      {uploadOpen && <UploadDialog onClose={() => { if (!uploadMutation.isPending) setUploadOpen(false) }} onUpload={(files) => uploadMutation.mutate(files)} isUploading={uploadMutation.isPending} error={uploadMutation.error?.message ?? null} />}
       {selectedId !== null && (
         selectedQuery.isLoading ? <div className="review-backdrop"><div className="review-loading"><LoaderCircle className="spin" size={24} /> Loading invoice…</div></div>
           : selectedQuery.error ? <div className="review-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeReview() }}><div className="review-error"><button className="icon-button" type="button" onClick={closeReview} aria-label="Close"><X size={18} /></button><CircleAlert size={22} /><strong>Couldn’t open this invoice</strong><span>{selectedQuery.error.message}</span><button className="button button-quiet" type="button" onClick={() => void selectedQuery.refetch()}>Try again</button></div></div>

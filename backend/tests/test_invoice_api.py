@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import io
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from threading import Event
 from typing import Iterator
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.api import invoices as invoice_api
 from app.config import Settings
@@ -87,9 +88,8 @@ def _extraction_result(invoice: InvoiceData | None = None) -> ExtractionResult:
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     engine = create_engine(
-        "sqlite://",
+        f"sqlite:///{tmp_path / 'test-invoices.db'}",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
     test_sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -103,6 +103,7 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
         storage_dir=str(tmp_path / "documents"),
         max_upload_size_mb=1,
     )
+    monkeypatch.setattr(invoice_api, "SessionLocal", test_sessions)
     monkeypatch.setattr(invoice_api, "get_settings", lambda: settings)
     app.dependency_overrides[get_db] = override_get_db
     client = TestClient(app)
@@ -116,6 +117,17 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
 
 def _upload_mock(monkeypatch: pytest.MonkeyPatch, result: ExtractionResult) -> None:
     monkeypatch.setattr(invoice_api, "extract_document", lambda *args, **kwargs: result)
+
+
+def _wait_for_processing(api_client: TestClient, invoice_id: int, *, max_attempts: int = 30) -> dict:
+    for _ in range(max_attempts):
+        response = api_client.get(f"/api/invoices/{invoice_id}")
+        assert response.status_code == 200
+        body = response.json()
+        if body["processing_status"] not in {"PENDING", "PROCESSING"}:
+            return body
+        time.sleep(0.1)
+    return response.json()
 
 
 def test_upload_runs_local_extraction_without_external_provider(
@@ -154,14 +166,71 @@ def test_upload_runs_local_extraction_without_external_provider(
 
     assert response.status_code == 201
     body = response.json()
-    assert body["processing_status"] == "COMPLETED"
-    assert body["invoice_number"] == "RT-2024-1052"
-    assert body["total_amount"] == "113565.00"
-    assert body["extraction_metadata"]["provider"] == "local"
+    assert body["processing_status"] == "PROCESSING"
+    assert body["invoice_number"] is None
+    assert body["extraction_metadata"] == {}
+
+    completed = _wait_for_processing(api_client, body["id"])
+    assert completed["processing_status"] == "COMPLETED"
+    assert completed["invoice_number"] == "RT-2024-1052"
+    assert completed["total_amount"] == "113565.00"
+    assert completed["extraction_metadata"]["provider"] == "local"
     assert any(
         "No line items could be reliably matched" in warning
-        for warning in body["extraction_metadata"]["warnings"]
+        for warning in completed["extraction_metadata"]["warnings"]
     )
+
+
+def test_bulk_upload_returns_while_each_invoice_processes_in_background(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extraction_started = Event()
+    continue_extraction = Event()
+
+    def blocked_extraction(*args: object, **kwargs: object) -> ExtractionResult:
+        del args, kwargs
+        extraction_started.set()
+        continue_extraction.wait(timeout=5)
+        return _extraction_result()
+
+    monkeypatch.setattr(invoice_api, "extract_document", blocked_extraction)
+    response = api_client.post(
+        "/api/invoices/bulk-upload",
+        files=[
+            ("files", ("first.png", _png_bytes(), "image/png")),
+            ("files", ("second.png", _png_bytes(), "image/png")),
+        ],
+    )
+
+    assert response.status_code == 202
+    invoices = response.json()
+    assert len(invoices) == 2
+    assert all(invoice["processing_status"] == "PROCESSING" for invoice in invoices)
+    assert extraction_started.wait(timeout=1)
+
+    try:
+        stored_documents = list((tmp_path / "documents").iterdir())
+        assert len(stored_documents) == 2
+    finally:
+        continue_extraction.set()
+
+    completed = [_wait_for_processing(api_client, invoice["id"]) for invoice in invoices]
+    assert all(invoice["processing_status"] == "COMPLETED" for invoice in completed)
+
+
+def test_bulk_upload_enforces_file_count_limit(api_client: TestClient) -> None:
+    response = api_client.post(
+        "/api/invoices/bulk-upload",
+        files=[
+            ("files", (f"invoice-{index}.png", _png_bytes(), "image/png"))
+            for index in range(invoice_api.MAX_BULK_UPLOAD_FILES + 1)
+        ],
+    )
+
+    assert response.status_code == 413
+    assert "no more than" in response.json()["detail"]
 
 
 def test_upload_persists_invoice_evidence_and_original_document(
@@ -178,12 +247,16 @@ def test_upload_persists_invoice_evidence_and_original_document(
 
     assert response.status_code == 201
     data = response.json()
-    assert data["invoice_number"] == "RT-2024-1052"
-    assert data["processing_status"] == "COMPLETED"
-    assert data["validation_status"] == "PASSED"
-    assert data["items"][0]["currency"] == "NPR"
-    assert data["field_evidence"]["invoice_number"]["ocr_confidence"] == 0.97
-    assert data["extraction_metadata"]["ocr_lines"][0]["page_number"] == 1
+    assert data["processing_status"] == "PROCESSING"
+    assert data["invoice_number"] is None
+
+    completed = _wait_for_processing(api_client, data["id"])
+    assert completed["invoice_number"] == "RT-2024-1052"
+    assert completed["processing_status"] == "COMPLETED"
+    assert completed["validation_status"] == "PASSED"
+    assert completed["items"][0]["currency"] == "NPR"
+    assert completed["field_evidence"]["invoice_number"]["ocr_confidence"] == 0.97
+    assert completed["extraction_metadata"]["ocr_lines"][0]["page_number"] == 1
     stored_path = next((tmp_path / "documents").iterdir())
     assert stored_path.read_bytes() == _png_bytes()
     assert stored_path.name != "invoice.png"
@@ -210,10 +283,14 @@ def test_upload_retains_ocr_if_provider_returns_failure(
 
     assert response.status_code == 201
     body = response.json()
-    assert body["processing_status"] == "FAILED"
-    assert body["processing_error"] == "GEMINI_API_KEY is not configured."
-    assert body["invoice_number"] is None
-    assert body["extraction_metadata"]["ocr_lines"][0]["text"] == (
+    assert body["processing_status"] == "PROCESSING"
+    assert body["processing_error"] is None
+
+    failed = _wait_for_processing(api_client, body["id"])
+    assert failed["processing_status"] == "FAILED"
+    assert failed["processing_error"] == "GEMINI_API_KEY is not configured."
+    assert failed["invoice_number"] is None
+    assert failed["extraction_metadata"]["ocr_lines"][0]["text"] == (
         "Invoice RT-2024-1052"
     )
 
@@ -263,6 +340,7 @@ def test_invoice_history_search_filter_sort_and_pagination(
             files={"file": (f"{index}.png", _png_bytes(), "image/png")},
         )
         assert response.status_code == 201
+        _wait_for_processing(api_client, response.json()["id"])
 
     response = api_client.get(
         "/api/invoices",
@@ -286,6 +364,9 @@ def test_patch_marks_corrections_and_revalidates(
         "/api/invoices/upload",
         files={"file": ("invoice.png", _png_bytes(), "image/png")},
     ).json()
+
+    invoice = _wait_for_processing(api_client, uploaded["id"])
+    assert invoice["processing_status"] == "COMPLETED"
 
     response = api_client.patch(
         f"/api/invoices/{uploaded['id']}",
@@ -311,6 +392,8 @@ def test_validate_endpoint_replaces_saved_check_results(
         files={"file": ("invoice.png", _png_bytes(), "image/png")},
     ).json()
 
+    _wait_for_processing(api_client, uploaded["id"])
+
     response = api_client.post(f"/api/invoices/{uploaded['id']}/validate")
 
     assert response.status_code == 200
@@ -324,6 +407,8 @@ def test_invoice_export_and_document_preview(api_client: TestClient, monkeypatch
         "/api/invoices/upload",
         files={"file": ("invoice.png", _png_bytes(), "image/png")},
     ).json()
+
+    _wait_for_processing(api_client, uploaded["id"])
 
     exported = api_client.get(f"/api/invoices/{uploaded['id']}/export")
     preview = api_client.get(f"/api/invoices/{uploaded['id']}/document")
@@ -349,6 +434,8 @@ def test_dashboard_uses_records_and_groups_values_by_currency(
         files={"file": ("invoice.png", _png_bytes(), "image/png")},
     )
     assert uploaded.status_code == 201
+    uploaded_body = uploaded.json()
+    _wait_for_processing(api_client, uploaded_body["id"])
 
     failed_result = ExtractionResult(
         filename="failed.png",
@@ -362,6 +449,8 @@ def test_dashboard_uses_records_and_groups_values_by_currency(
         files={"file": ("failed.png", _png_bytes(), "image/png")},
     )
     assert failed.status_code == 201
+    failed_body = failed.json()
+    _wait_for_processing(api_client, failed_body["id"])
 
     response = api_client.get("/api/dashboard/stats")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Callable
 
 from app.config import Settings, get_settings
@@ -41,6 +42,7 @@ class ExtractionResult:
     validation: ValidationReport | None = None
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
+    stage_timings_ms: dict[str, float] = field(default_factory=dict)
 
 
 def _ocr_context(
@@ -73,6 +75,8 @@ def extract_document(
 ) -> ExtractionResult:
     """Run document rendering, OCR, and vision extraction without storing files."""
     config = settings or get_settings()
+    total_started = perf_counter()
+    stage_started = perf_counter()
     document: ProcessedDocument = process_document(
         content,
         filename,
@@ -80,20 +84,30 @@ def extract_document(
         render_dpi=config.document_render_dpi,
         max_file_bytes=config.max_upload_size_mb * 1024 * 1024,
     )
+    stage_timings_ms = {
+        "document_render_ms": round((perf_counter() - stage_started) * 1000, 1)
+    }
     result = ExtractionResult(
         filename=document.filename,
         source_type=document.source_type,
         page_count=len(document.pages),
     )
     ocr = ocr_service or PaddleOCRService()
+    stage_started = perf_counter()
     try:
         result.ocr_lines = ocr.extract(document.pages)
     except OCRUnavailableError as exc:
         result.warnings.append(str(exc))
+    finally:
+        stage_timings_ms["ocr_ms"] = round((perf_counter() - stage_started) * 1000, 1)
 
     provider_builder = provider_factory or (lambda: create_vision_provider(config))
     try:
+        stage_started = perf_counter()
         provider = provider_builder()
+        stage_timings_ms["provider_setup_ms"] = round(
+            (perf_counter() - stage_started) * 1000, 1
+        )
         result.provider = provider.name
         ocr_text, was_truncated = _ocr_context(
             result.ocr_lines,
@@ -103,17 +117,34 @@ def extract_document(
             result.warnings.append(
                 "OCR text exceeded the vision prompt limit; full OCR remains available for review."
             )
-        raw_data = provider.extract(document.pages, ocr_text)
+        stage_started = perf_counter()
+        try:
+            raw_data = provider.extract(document.pages, ocr_text)
+        finally:
+            stage_timings_ms["provider_extract_ms"] = round(
+                (perf_counter() - stage_started) * 1000, 1
+            )
         result.raw_extraction = raw_data
         if isinstance(provider, LocalRuleBasedProvider):
             result.warnings.extend(provider.warnings)
-        invoice, normalization_warnings = normalize_extraction(raw_data)
-        result.invoice = attach_ocr_evidence(invoice, result.ocr_lines, provider.name)
-        result.validation = validate_invoice(result.invoice, settings=config)
-        result.warnings.extend(normalization_warnings)
+        result.warnings = list(dict.fromkeys(result.warnings))
+        stage_started = perf_counter()
+        try:
+            invoice, normalization_warnings = normalize_extraction(raw_data)
+            result.invoice = attach_ocr_evidence(invoice, result.ocr_lines, provider.name)
+            result.validation = validate_invoice(result.invoice, settings=config)
+            result.warnings.extend(normalization_warnings)
+        finally:
+            stage_timings_ms["normalize_validate_ms"] = round(
+                (perf_counter() - stage_started) * 1000, 1
+            )
     except (ProviderError, ExtractionNormalizationError) as exc:
         result.error = str(exc)
         result.warnings.append(
             "Invoice extraction did not complete; available OCR text is preserved for review."
         )
+    result.stage_timings_ms = stage_timings_ms
+    result.stage_timings_ms["pipeline_total_ms"] = round(
+        (perf_counter() - total_started) * 1000, 1
+    )
     return result

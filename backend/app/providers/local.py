@@ -638,4 +638,5 @@ class LocalRuleBasedProvider:
                 "the OCR text. Review the OCR and enter details manually."
             )
 
+        self.warnings = list(dict.fromkeys(self.warnings))
         return data

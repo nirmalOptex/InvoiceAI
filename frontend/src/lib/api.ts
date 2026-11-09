@@ -221,6 +221,12 @@ export function uploadInvoice(file: File): Promise<Invoice> {
   return request('/api/invoices/upload', { method: 'POST', body: form })
 }
 
+export function uploadInvoices(files: File[]): Promise<Invoice[]> {
+  const form = new FormData()
+  for (const file of files) form.append('files', file)
+  return request('/api/invoices/bulk-upload', { method: 'POST', body: form })
+}
+
 export function updateInvoice(id: number, correction: InvoiceCorrection): Promise<Invoice> {
   return request(`/api/invoices/${id}`, {
     method: 'PATCH',
