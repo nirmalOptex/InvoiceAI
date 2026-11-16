@@ -4,7 +4,6 @@ import mimetypes
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from threading import Thread
 from time import perf_counter
 import uuid
 from decimal import Decimal
@@ -12,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
@@ -53,7 +52,7 @@ ALLOWED_CONTENT_TYPES = {
 }
 MAX_BULK_UPLOAD_FILES = 10
 _processing_executor = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="invoice-processing"
+    max_workers=1, thread_name_prefix="invoice-processing"
 )
 SORT_COLUMNS = {
     "created_at": Invoice.created_at,
@@ -406,6 +405,26 @@ def _queue_invoice_processing(
         _set_processing_failure(invoice_id, "Invoice processing is unavailable.")
 
 
+def resume_interrupted_invoice_processing() -> None:
+    settings = get_settings()
+    with SessionLocal() as session:
+        interrupted = session.execute(
+            select(Invoice.id, Invoice.stored_filename)
+            .where(
+                Invoice.processing_status.in_(
+                    [ProcessingStatus.PENDING.value, ProcessingStatus.PROCESSING.value]
+                )
+            )
+            .order_by(Invoice.id)
+        ).all()
+
+    for invoice_id, stored_filename in interrupted:
+        logger.info(
+            "Resuming interrupted invoice processing (invoice_id=%s)", invoice_id
+        )
+        _queue_invoice_processing(invoice_id, stored_filename, settings)
+
+
 @router.post(
     "/invoices/upload",
     response_model=InvoiceRead,
@@ -413,7 +432,6 @@ def _queue_invoice_processing(
 )
 def upload_invoice(
     file: Annotated[UploadFile, File()],
-    background_tasks: BackgroundTasks,
     session: Annotated[Session, Depends(get_db)],
 ) -> Invoice:
     settings = get_settings()
@@ -446,13 +464,7 @@ def upload_invoice(
                 detail="Invoice persistence failed and stored-file cleanup also failed.",
             ) from cleanup_error
         raise
-    thread = Thread(
-        target=_process_uploaded_invoice,
-        args=(invoice.id, stored_filename, settings),
-        daemon=True,
-        name=f"invoice-processing-{invoice.id}",
-    )
-    thread.start()
+    _queue_invoice_processing(invoice.id, stored_filename, settings)
     return invoice
 
 

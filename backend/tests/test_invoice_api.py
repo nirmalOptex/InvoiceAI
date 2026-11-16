@@ -242,6 +242,50 @@ def test_reprocess_rejects_an_invoice_already_processing(
     assert queued == [invoice_id]
 
 
+def test_startup_requeues_interrupted_invoice_processing(
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with invoice_api.SessionLocal() as session:
+        interrupted = Invoice(
+            original_filename="interrupted.png",
+            stored_filename="interrupted.png",
+            processing_status="PROCESSING",
+            validation_status="PENDING",
+        )
+        pending = Invoice(
+            original_filename="pending.png",
+            stored_filename="pending.png",
+            processing_status="PENDING",
+            validation_status="PENDING",
+        )
+        completed = Invoice(
+            original_filename="completed.png",
+            stored_filename="completed.png",
+            processing_status="COMPLETED",
+            validation_status="PASSED",
+        )
+        session.add_all([interrupted, pending, completed])
+        session.commit()
+        expected = {
+            (interrupted.id, interrupted.stored_filename),
+            (pending.id, pending.stored_filename),
+        }
+
+    queued: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        invoice_api,
+        "_queue_invoice_processing",
+        lambda invoice_id, stored_filename, settings: queued.append(
+            (invoice_id, stored_filename)
+        ),
+    )
+
+    invoice_api.resume_interrupted_invoice_processing()
+
+    assert set(queued) == expected
+
+
 def test_bulk_upload_returns_while_each_invoice_processes_in_background(
     api_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -495,14 +539,11 @@ def test_verify_invoice_rejects_incomplete_processing(
     api_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class UnstartedThread:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        def start(self) -> None:
-            pass
-
-    monkeypatch.setattr(invoice_api, "Thread", UnstartedThread)
+    monkeypatch.setattr(
+        invoice_api,
+        "_queue_invoice_processing",
+        lambda invoice_id, stored_filename, settings: None,
+    )
     uploaded = api_client.post(
         "/api/invoices/upload",
         files={"file": ("invoice.png", _png_bytes(), "image/png")},

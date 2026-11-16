@@ -28,8 +28,8 @@ from app.services.normalizer import ExtractionNormalizationError
 from app.services.ocr_service import (
     OCRLine,
     OCRUnavailableError,
-    PaddleOCRService,
-    parse_paddle_result,
+    RapidOCRService,
+    parse_rapid_result,
 )
 
 SAMPLE_DATA = {
@@ -151,40 +151,31 @@ def test_encrypted_pdf_is_rejected() -> None:
         process_document(protected, "locked.pdf")
 
 
-def test_paddle_ocr_parser_normalizes_legacy_and_v3_shapes() -> None:
-    legacy = [
-        [
-            [[0, 0], [20, 0], [20, 10], [0, 10]],
-            ("Invoice RT-2024-1052", 0.97),
-        ]
-    ]
-    modern = {
-        "rec_texts": ["Total 113,565.00"],
-        "rec_scores": [0.91],
-        "rec_polys": [[[1, 2], [3, 2], [3, 4], [1, 4]]],
-    }
+def test_rapid_ocr_parser_normalizes_detected_lines() -> None:
+    box = [[0, 0], [20, 0], [20, 10], [0, 10]]
+    parsed = parse_rapid_result(
+        ([[box, "Invoice RT-2024-1052", 0.97]], 0.12),
+        1,
+    )
 
-    parsed_legacy = parse_paddle_result([legacy], 1)
-    parsed_modern = parse_paddle_result(modern, 2)
-
-    assert parsed_legacy[0].text == "Invoice RT-2024-1052"
-    assert parsed_legacy[0].confidence == 0.97
-    assert parsed_legacy[0].page_number == 1
-    assert parsed_modern[0].bounding_box == [1, 2, 3, 2, 3, 4, 1, 4]
-    assert parsed_modern[0].page_number == 2
+    assert parsed[0].text == "Invoice RT-2024-1052"
+    assert parsed[0].confidence == 0.97
+    assert parsed[0].bounding_box == [0, 0, 20, 0, 20, 10, 0, 10]
+    assert parsed[0].page_number == 1
 
 
-def test_paddle_ocr_service_uses_injected_engine_without_model_download() -> None:
+def test_rapid_ocr_service_uses_injected_engine_without_model_download() -> None:
     engine = Mock()
     box = [[0, 0], [4, 0], [4, 2], [0, 2]]
-    engine.ocr.return_value = [[[box, ("Subtotal", 0.9)]]]
-    service = PaddleOCRService(engine=engine)
+    engine.return_value = ([[box, "Subtotal", 0.9]], 0.12)
+    service = RapidOCRService(engine=engine)
     page = process_document(_png_bytes(), "invoice.png").pages[0]
 
     lines = service.extract([page])
 
     assert lines[0].text == "Subtotal"
-    engine.ocr.assert_called_once()
+    assert lines[0].confidence == 0.9
+    engine.assert_called_once()
 
 
 def test_normalization_uses_decimal_and_keeps_ambiguous_dates_unset() -> None:

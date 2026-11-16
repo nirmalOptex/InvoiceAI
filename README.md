@@ -47,7 +47,7 @@ test -f .env || cp .env.example .env
 npm run dev
 ```
 
-Open the frontend at `http://localhost:5173`. The backend API is at `http://localhost:8000`; its interactive docs are at `http://localhost:8000/docs`. PaddleOCR downloads its models on first use.
+Open the frontend at `http://localhost:5173`. The backend API is at `http://localhost:8000`; its interactive docs are at `http://localhost:8000/docs`. The backend uses RapidOCR with ONNX Runtime for local text recognition.
 
 ## Deploying a public demo
 
@@ -59,4 +59,4 @@ The app can be deployed with Vercel (frontend), Render (FastAPI API), and Supaba
 4. After Vercel provides the frontend URL, set Render's `CORS_ORIGINS` to that exact origin (for example, `https://your-project.vercel.app`) and redeploy the API.
 5. Verify the API at `https://your-render-service.onrender.com/api/health`, then test an upload, document preview, and delete using a dummy invoice.
 
-Render builds the OCR dependencies and downloads PaddleOCR models on first use, so the first deployment or invoice may take longer. The app does not currently have user authentication: anyone with the public URL can view, upload, edit, or delete demo invoices. Use synthetic data only; do not upload real or confidential invoices.
+Render installs the lightweight RapidOCR/ONNX Runtime dependencies. Invoice processing runs one document at a time, and invoices left in progress by a service restart are re-queued at startup. The app does not currently have user authentication: anyone with the public URL can view, upload, edit, or delete demo invoices. Use synthetic data only; do not upload real or confidential invoices.

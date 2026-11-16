@@ -22,7 +22,7 @@ from app.services.ocr_service import (
     OCRLine,
     OCRService,
     OCRUnavailableError,
-    PaddleOCRService,
+    RapidOCRService,
 )
 from app.services.validator import validate_invoice
 from app.schemas.invoice import ValidationReport
@@ -92,7 +92,7 @@ def extract_document(
         source_type=document.source_type,
         page_count=len(document.pages),
     )
-    ocr = ocr_service or PaddleOCRService()
+    ocr = ocr_service or RapidOCRService()
     stage_started = perf_counter()
     try:
         result.ocr_lines = ocr.extract(document.pages)

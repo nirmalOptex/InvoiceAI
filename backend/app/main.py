@@ -4,7 +4,10 @@ from collections.abc import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.invoices import router as invoices_router
+from app.api.invoices import (
+    resume_interrupted_invoice_processing,
+    router as invoices_router,
+)
 from app.config import get_settings
 from app.database import create_database_tables
 from app.schemas.invoice import HealthResponse
@@ -15,6 +18,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     create_database_tables()
+    resume_interrupted_invoice_processing()
     yield
 
 
