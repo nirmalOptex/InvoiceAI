@@ -3,7 +3,6 @@ from __future__ import annotations
 import mimetypes
 import logging
 import os
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from time import perf_counter
@@ -11,9 +10,10 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, cast
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -33,6 +33,13 @@ from app.schemas.invoice import (
     ValidationStatus,
 )
 from app.services.document_processing import DocumentProcessingError, safe_filename
+from app.services.document_storage import (
+    DocumentStorageError,
+    StoredDocumentNotFoundError,
+    delete_document,
+    read_document,
+    store_document,
+)
 from app.services.extraction_pipeline import ExtractionResult, extract_document
 from app.services.validator import validate_invoice
 
@@ -140,41 +147,28 @@ def _validate_upload_type(upload: UploadFile, content: bytes | None = None) -> N
 
 
 def _store_document(content: bytes, filename: str, settings: Settings) -> str:
-    suffix = Path(filename).suffix.lower()
-    stored_filename = f"{uuid.uuid4().hex}{suffix}"
-    storage_dir = Path(settings.storage_dir).resolve()
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    destination = storage_dir / stored_filename
-    temporary_path: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=".upload-", suffix=".tmp", dir=storage_dir, delete=False
-        ) as temporary:
-            temporary_path = temporary.name
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_path, destination)
-    except OSError as exc:
-        if temporary_path and os.path.exists(temporary_path):
-            os.unlink(temporary_path)
-        raise HTTPException(
-            status_code=500, detail="Could not store the uploaded invoice."
-        ) from exc
-    return stored_filename
+        return store_document(content, filename, settings)
+    except DocumentStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _delete_stored_document(stored_filename: str, settings: Settings) -> None:
-    storage_dir = Path(settings.storage_dir).resolve()
-    path = (storage_dir / stored_filename).resolve()
-    if path.parent != storage_dir:
-        raise HTTPException(status_code=500, detail="Stored document path is invalid.")
     try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
+        delete_document(stored_filename, settings)
+    except DocumentStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _read_stored_document(stored_filename: str, settings: Settings) -> bytes:
+    try:
+        return read_document(stored_filename, settings)
+    except StoredDocumentNotFoundError as exc:
         raise HTTPException(
-            status_code=500, detail="Could not remove the stored invoice document."
+            status_code=404, detail="Invoice document is unavailable."
         ) from exc
+    except DocumentStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _record_validation_results(invoice: Invoice, checks: list[ValidationCheck]) -> None:
@@ -359,11 +353,7 @@ def _process_uploaded_invoice(
                 return
             filename = invoice.original_filename
 
-        storage_dir = Path(settings.storage_dir).resolve()
-        stored_path = (storage_dir / stored_filename).resolve()
-        if stored_path.parent != storage_dir:
-            raise OSError("Stored invoice path is invalid.")
-        content = stored_path.read_bytes()
+        content = read_document(stored_filename, settings)
         result = extract_document(content, filename, settings=settings)
 
         with SessionLocal() as session:
@@ -638,10 +628,7 @@ def reprocess_invoice(
         )
 
     settings = get_settings()
-    storage_dir = Path(settings.storage_dir).resolve()
-    stored_path = (storage_dir / invoice.stored_filename).resolve()
-    if stored_path.parent != storage_dir or not stored_path.is_file():
-        raise HTTPException(status_code=404, detail="Invoice document is unavailable.")
+    _read_stored_document(invoice.stored_filename, settings)
 
     invoice.processing_status = ProcessingStatus.PROCESSING.value
     invoice.processing_error = None
@@ -656,21 +643,21 @@ def reprocess_invoice(
 def get_invoice_document(
     invoice_id: int,
     session: Annotated[Session, Depends(get_db)],
-) -> FileResponse:
+) -> Response:
     invoice = _invoice_or_404(session, invoice_id)
     settings = get_settings()
-    storage_dir = Path(settings.storage_dir).resolve()
-    path = (storage_dir / invoice.stored_filename).resolve()
-    if path.parent != storage_dir or not path.is_file():
-        raise HTTPException(status_code=404, detail="Invoice document is unavailable.")
+    content = _read_stored_document(invoice.stored_filename, settings)
     content_type = mimetypes.guess_type(invoice.original_filename)[0]
     if content_type not in {"application/pdf", "image/png", "image/jpeg"}:
         raise HTTPException(status_code=415, detail="Stored document type is unsupported.")
-    return FileResponse(
-        path,
+    return Response(
+        content=content,
         media_type=content_type,
-        filename=invoice.original_filename,
-        content_disposition_type="inline",
+        headers={
+            "Content-Disposition": (
+                f"inline; filename*=UTF-8''{quote(invoice.original_filename, safe='')}"
+            )
+        },
     )
 
 
@@ -745,6 +732,22 @@ def delete_invoice(
     invoice = _invoice_or_404(session, invoice_id)
     stored_filename = invoice.stored_filename
     settings = get_settings()
+    if settings.storage_backend == "supabase":
+        session.delete(invoice)
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        try:
+            _delete_stored_document(stored_filename, settings)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Invoice was deleted, but its stored document could not be removed.",
+            ) from exc
+        return
+
     storage_dir = Path(settings.storage_dir).resolve()
     source_path = (storage_dir / stored_filename).resolve()
     if source_path.parent != storage_dir:

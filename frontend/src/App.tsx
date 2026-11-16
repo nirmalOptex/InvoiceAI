@@ -27,6 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import {
+  API_BASE_URL,
   deleteInvoice,
   getDashboardStats,
   getHealth,
@@ -1007,7 +1008,7 @@ function App() {
             <strong className="mt-3 block text-sm font-semibold text-[#f3f5ef]">Review with confidence</strong>
             <p className="mt-1 text-xs leading-relaxed text-[#d1dbd2]">OCR evidence and deterministic checks keep every invoice traceable.</p>
           </div>
-          <div className={"[display:flex] [height:35px] [align-items:center] [gap:8px] [border-top:1px_solid_#edf0f3] [padding:12px_5px_0] [color:#788295] [font-size:11px] [&_a]:[display:grid] [&_a]:[color:#8590a0] [border-color:#365447] [color:#b2c1b6] [&_a]:[color:#b2c1b6]"}><span className={`[width:7px] [height:7px] [border-radius:50%] [background:#17b26a] ${healthQuery.isSuccess && healthQuery.data.status === 'ok' ? '' : '[background:#e05252]'}`} />{healthQuery.isLoading ? 'Checking API…' : healthQuery.isSuccess && healthQuery.data.status === 'ok' ? 'API connected' : 'API unavailable'}<button className={"[display:grid] [width:21px] [height:21px] [place-items:center] [margin-left:auto] [border:0] [border-radius:5px] [background:transparent] [color:#929aaa] [&:hover]:[background:#f3f5f7] [&:hover]:[color:#475368] [color:#b2c1b6] [&:hover]:[background:rgb(255_255_255_/_9%)] [&:hover]:[color:#fff]"} type="button" onClick={() => void healthQuery.refetch()} aria-label="Check API connection"><RefreshCw size={13} /></button><a href="http://localhost:8000/docs" target="_blank" rel="noreferrer" aria-label="Open API docs"><ArrowUpRight size={14} /></a></div>
+          <div className={"[display:flex] [height:35px] [align-items:center] [gap:8px] [border-top:1px_solid_#edf0f3] [padding:12px_5px_0] [color:#788295] [font-size:11px] [&_a]:[display:grid] [&_a]:[color:#8590a0] [border-color:#365447] [color:#b2c1b6] [&_a]:[color:#b2c1b6]"}><span className={`[width:7px] [height:7px] [border-radius:50%] [background:#17b26a] ${healthQuery.isSuccess && healthQuery.data.status === 'ok' ? '' : '[background:#e05252]'}`} />{healthQuery.isLoading ? 'Checking API…' : healthQuery.isSuccess && healthQuery.data.status === 'ok' ? 'API connected' : 'API unavailable'}<button className={"[display:grid] [width:21px] [height:21px] [place-items:center] [margin-left:auto] [border:0] [border-radius:5px] [background:transparent] [color:#929aaa] [&:hover]:[background:#f3f5f7] [&:hover]:[color:#475368] [color:#b2c1b6] [&:hover]:[background:rgb(255_255_255_/_9%)] [&:hover]:[color:#fff]"} type="button" onClick={() => void healthQuery.refetch()} aria-label="Check API connection"><RefreshCw size={13} /></button><a href={`${API_BASE_URL}/docs`} target="_blank" rel="noreferrer" aria-label="Open API docs"><ArrowUpRight size={14} /></a></div>
         </div>
       </aside>
 
@@ -1028,7 +1029,7 @@ function App() {
             <InvoiceHistory data={invoicesQuery.data} params={params} onParamsChange={changeParams} onOpen={openInvoice} onUpload={() => { uploadMutation.reset(); setUploadOpen(true) }} isLoading={invoicesQuery.isLoading} />
           )}
         </main>
-        <footer className={"[display:flex] [min-height:47px] [align-items:center] [justify-content:space-between] [gap:14px] [border-top:1px_solid_#eaedf1] [padding:0_40px] [color:#98a1af] [font-size:10px] [&_a]:[display:inline-flex] [&_a]:[align-items:center] [&_a]:[gap:4px] [&_a]:[color:#728096] max-[1150px]:[padding-right:25px] max-[1150px]:[padding-left:25px] max-[850px]:[padding:0_20px] max-[680px]:[padding:0_14px] max-[680px]:[font-size:9px] [border-color:var(--line)] [color:#8a948c] [&_a]:[color:#5e725f] max-[680px]:[background:var(--paper)]"}><span>InvoiceIQ · Invoice processing with evidence</span><a href="http://localhost:8000/docs" target="_blank" rel="noreferrer">API documentation <ArrowUpRight size={13} /></a></footer>
+        <footer className={"[display:flex] [min-height:47px] [align-items:center] [justify-content:space-between] [gap:14px] [border-top:1px_solid_#eaedf1] [padding:0_40px] [color:#98a1af] [font-size:10px] [&_a]:[display:inline-flex] [&_a]:[align-items:center] [&_a]:[gap:4px] [&_a]:[color:#728096] max-[1150px]:[padding-right:25px] max-[1150px]:[padding-left:25px] max-[850px]:[padding:0_20px] max-[680px]:[padding:0_14px] max-[680px]:[font-size:9px] [border-color:var(--line)] [color:#8a948c] [&_a]:[color:#5e725f] max-[680px]:[background:var(--paper)]"}><span>InvoiceIQ · Invoice processing with evidence</span><a href={`${API_BASE_URL}/docs`} target="_blank" rel="noreferrer">API documentation <ArrowUpRight size={13} /></a></footer>
       </div>
 
       {uploadOpen && <UploadDialog onClose={() => { if (!uploadMutation.isPending) setUploadOpen(false) }} onUpload={(files) => uploadMutation.mutate(files)} isUploading={uploadMutation.isPending} error={uploadMutation.error?.message ?? null} />}
