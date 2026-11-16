@@ -1,7 +1,8 @@
 from functools import lru_cache
 from decimal import Decimal
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +10,10 @@ class Settings(BaseSettings):
     app_name: str = "InvoiceIQ"
     database_url: str = "sqlite:///./invoiceiq.db"
     storage_dir: str = "./storage"
+    storage_backend: Literal["local", "supabase"] = "local"
+    supabase_url: str | None = None
+    supabase_service_role_key: SecretStr | None = Field(default=None, repr=False)
+    supabase_storage_bucket: str = "invoice-documents"
     ai_provider: str = "local"
     gemini_api_key: str | None = None
     anthropic_api_key: str | None = None
@@ -28,6 +33,21 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_storage_settings(self) -> "Settings":
+        if self.storage_backend == "supabase" and (
+            not self.supabase_url
+            or not self.supabase_url.strip()
+            or not self.supabase_service_role_key
+            or not self.supabase_service_role_key.get_secret_value().strip()
+            or not self.supabase_storage_bucket.strip()
+        ):
+            raise ValueError(
+                "Supabase storage requires SUPABASE_URL, "
+                "SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_STORAGE_BUCKET."
+            )
+        return self
 
     @property
     def allowed_origins(self) -> list[str]:
